@@ -1,0 +1,70 @@
+# CIFAR-10配置文件
+
+# 实验基本配置
+experiment:
+  name: "sama_cifar10"
+  seed: 42
+  device: "cuda"
+
+# 联邦学习配置
+federated:
+  num_clients: 20
+  byzantine_ratio: 0.2
+  num_rounds: 400  # 优化：大batch加速，从500减到400
+  local_epochs: 2
+  batch_size: 128  # 优化：利用32GB显存
+  num_workers: 8   # 优化：利用12核CPU
+
+# 数据配置
+data:
+  dataset: "cifar10"
+  data_dir: "./data"
+  non_iid_alpha: 0.1
+
+# 网络拓扑
+topology:
+  type: "ring"
+  degree: 4
+
+# 模型配置
+model:
+  name: "simple_cnn"
+  num_classes: 10
+
+# 优化器配置
+optimizer:
+  type: "sgd"
+  lr: 0.02  # 优化：大batch_size对应增大学习率 (0.01→0.02)
+  momentum: 0.9
+  weight_decay: 0.0001
+
+# SAMA-DFL
+sama:
+  alpha: 0.5
+  use_temperature: true
+  tau_max: 1.0
+  tau_min: 0.01
+  trust_layers: ["fc2.weight", "fc2.bias"]
+  adaptive_alpha: true
+
+# BALANCE参数
+balance:
+  alpha: 0.5
+  gamma: 0.5
+  kappa: 0.1
+
+# SCCLIP参数
+scclip:
+  alpha: 0.5
+  clip_constant: 0.1
+
+# 攻击配置
+attack:
+  type: "gaussian"
+  gaussian_std: 5.0
+
+# 日志配置
+logging:
+  log_interval: 10
+  save_model: false
+  save_dir: "./results"

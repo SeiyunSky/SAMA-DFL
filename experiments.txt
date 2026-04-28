@@ -1,0 +1,10 @@
+# Experiment batch configuration
+# Format: attack_type, gaussian_std, amplification, description
+# Lines starting with # are comments
+gaussian, 5.0, 2.0, weak_gaussian
+gaussian, 10.0, 2.0, standard_gaussian
+gaussian, 20.0, 2.0, strong_gaussian
+label_flipping, 10.0, 2.0, label_flip
+omniscient, 10.0, 0.5, omniscient_C0.5
+omniscient, 10.0, 1.0, omniscient_C1.0
+omniscient, 10.0, 2.0, omniscient_C2.0
