@@ -9,6 +9,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from pathlib import Path
 import sys
+import os
 import yaml
 from tqdm import tqdm
 
@@ -19,7 +20,7 @@ plt.rcParams['font.family'] = 'DejaVu Sans'
 from aggregators import SAMAAggregator, BALANCEAggregator, SCCLIPAggregator
 from models import SimpleCNN
 from utils import load_cifar10, generate_ring_topology
-from attacks import GaussianAttack, LabelFlippingAttack, OmniscientAttack
+from attacks import GaussianAttack, LabelFlippingAttack, OmniscientAttack, KrumAttack, TrimAttack
 from collections import OrderedDict
 
 
@@ -49,14 +50,20 @@ class CIFAR10Trainer:
         self.honest_nodes = list(range(self.num_clients - num_byzantine))
         self.byzantine_nodes = list(range(self.num_clients - num_byzantine, self.num_clients))
 
-        # 攻击
-        attack_type = config['attack']['type']
+        # 攻击（环境变量 ATTACK_TYPE 可覆盖配置文件）
+        attack_type = os.getenv('ATTACK_TYPE', config['attack']['type'])
         if attack_type == 'gaussian':
             self.attack = GaussianAttack(std=config['attack']['gaussian_std'])
         elif attack_type == 'label_flipping':
             self.attack = LabelFlippingAttack(num_classes=10)
         elif attack_type == 'omniscient':
             self.attack = OmniscientAttack(amplification=config['attack'].get('amplification', 2.0))
+        elif attack_type == 'krum_attack':
+            self.attack = KrumAttack(num_byzantine=num_byzantine,
+                                     amplification=config['attack'].get('amplification', 1.0))
+        elif attack_type == 'trim_attack':
+            self.attack = TrimAttack(num_byzantine=num_byzantine,
+                                     trim_ratio=config['attack'].get('trim_ratio', 0.1))
         else:
             self.attack = None
 
@@ -73,9 +80,8 @@ class CIFAR10Trainer:
         if method == 'sama':
             aggregator = SAMAAggregator(
                 alpha=self.config['sama']['alpha'],
-                use_temperature=self.config['sama'].get('use_temperature', True),
+                use_temperature=self.config['sama'].get('use_temperature', False),
                 trust_layers=self.config['sama'].get('trust_layers', None),
-                adaptive_alpha=self.config['sama'].get('adaptive_alpha', False)
             )
         elif method == 'scclip':
             aggregator = SCCLIPAggregator(
@@ -104,11 +110,12 @@ class CIFAR10Trainer:
 
                 if i in self.honest_nodes:
                     model.train()
+                    optimizer = torch.optim.SGD(model.parameters(), lr=lr,
+                                                momentum=self.config['optimizer'].get('momentum', 0.0),
+                                                weight_decay=self.config['optimizer'].get('weight_decay', 0.0))
                     for epoch in range(local_epochs):
                         for data, target in self.train_loaders[i]:
                             data, target = data.to(self.device), target.to(self.device)
-
-                            optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
                             optimizer.zero_grad()
                             output = model(data)
                             loss = torch.nn.functional.cross_entropy(output, target)
@@ -116,12 +123,13 @@ class CIFAR10Trainer:
                             optimizer.step()
                 elif self.attack and isinstance(self.attack, LabelFlippingAttack):
                     model.train()
+                    optimizer = torch.optim.SGD(model.parameters(), lr=lr,
+                                                momentum=self.config['optimizer'].get('momentum', 0.0),
+                                                weight_decay=self.config['optimizer'].get('weight_decay', 0.0))
                     for epoch in range(local_epochs):
                         for data, target in self.train_loaders[i]:
                             data, target = data.to(self.device), target.to(self.device)
                             target = self.attack.flip_labels(target)
-
-                            optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
                             optimizer.zero_grad()
                             output = model(data)
                             loss = torch.nn.functional.cross_entropy(output, target)
@@ -132,8 +140,8 @@ class CIFAR10Trainer:
 
             # 拜占庭攻击（非Label Flipping类型）
             if self.attack and not isinstance(self.attack, LabelFlippingAttack):
-                if isinstance(self.attack, OmniscientAttack):
-                    honest_models = [local_models[i] for i in self.honest_nodes]
+                honest_models = [local_models[i] for i in self.honest_nodes]
+                if isinstance(self.attack, (OmniscientAttack, KrumAttack, TrimAttack)):
                     for byz_id in self.byzantine_nodes:
                         local_models[byz_id] = self.attack.attack(honest_models)
                 else:

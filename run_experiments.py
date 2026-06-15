@@ -52,21 +52,25 @@ def run_all_performance_experiments():
     perf_path = str(Path(__file__).parent / 'experiments' / 'performance')
     sys.path.insert(0, perf_path)
 
-    print("\n[1/4] C1: MNIST (SAMA vs BALANCE vs SCCLIP)")
-    module = importlib.import_module('mnist_experiment')
-    module.run_mnist_experiment()
+    print("\n[1/5] C1: MNIST multi-attack table (8 methods × 6 attacks)")
+    module = importlib.import_module('multi_attack_table')
+    module.run_multi_attack_table()
 
-    print("\n[2/4] C2: CIFAR-10 (SAMA vs BALANCE vs SCCLIP)")
-    module = importlib.import_module('cifar10_experiment')
-    module.run_cifar10_experiment()
+    print("\n[2/5] C2: CIFAR-10 multi-attack table (8 methods × 6 attacks)")
+    module = importlib.import_module('multi_attack_table')
+    module.run_cifar10_attack_table()
 
-    print("\n[3/4] C3: Byzantine ratio sweep")
+    print("\n[3/5] C3: Byzantine ratio sweep")
     module = importlib.import_module('sweep_experiments')
     module.run_byzantine_sweep()
 
-    print("\n[4/4] C4: Non-IID level sweep")
+    print("\n[4/5] C4: Non-IID level sweep")
     module = importlib.import_module('sweep_experiments')
     module.run_noniid_sweep()
+
+    print("\n[5/5] Ablation study (4 variants)")
+    module = importlib.import_module('ablation_study')
+    module.run_ablation_study()
 
     print("\n" + "="*80)
     print("Performance experiments complete")
@@ -79,7 +83,9 @@ def main():
                        choices=['all', 'theory', 'performance'],
                        help='Run mode: all, theory, performance')
     parser.add_argument('--experiment', type=str, default=None,
-                       help='Single experiment: lemma41, convergence, kappa, consensus, lyapunov, mnist, cifar10, byz_sweep, noniid_sweep, ablation')
+                       help='Single experiment: lemma41, convergence, kappa, consensus, lyapunov, '
+                            'cifar10_attack_table, multi_attack_table, byz_sweep, noniid_sweep, '
+                            'ablation, client_scale')
 
     args = parser.parse_args()
 
@@ -127,6 +133,18 @@ def main():
             sys.path.insert(0, perf_path)
             module = importlib.import_module('ablation_study')
             module.run_ablation_study()
+        elif args.experiment == 'cifar10_attack_table':
+            sys.path.insert(0, perf_path)
+            module = importlib.import_module('multi_attack_table')
+            module.run_cifar10_attack_table()
+        elif args.experiment == 'multi_attack_table':
+            sys.path.insert(0, perf_path)
+            module = importlib.import_module('multi_attack_table')
+            module.run_multi_attack_table()
+        elif args.experiment == 'client_scale':
+            sys.path.insert(0, perf_path)
+            module = importlib.import_module('client_scale_experiment')
+            module.run_client_scale_experiment()
         else:
             print(f"Unknown experiment: {args.experiment}")
             sys.exit(1)

@@ -3,8 +3,53 @@ Data loading utilities with Non-IID partitioning
 """
 import numpy as np
 import torch
+from pathlib import Path
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, Subset
+
+
+# ──────────────────────────────────────────────────────────
+# 数据集检测与下载
+# ──────────────────────────────────────────────────────────
+
+# 每个数据集在 data_dir 下预期存在的标志文件/目录
+_DATASET_MARKERS = {
+    'mnist': [
+        'MNIST/raw/train-images-idx3-ubyte',
+        'MNIST/raw/t10k-images-idx3-ubyte',
+    ],
+    'cifar10': [
+        'cifar-10-batches-py/data_batch_1',
+        'cifar-10-batches-py/test_batch',
+    ],
+}
+
+
+def check_dataset(name: str, data_dir: str = './data') -> bool:
+    """检查数据集是否已下载完整，返回 True/False"""
+    root = Path(data_dir)
+    markers = _DATASET_MARKERS.get(name.lower(), [])
+    return all((root / m).exists() for m in markers)
+
+
+def check_all_datasets(data_dir: str = './data') -> dict:
+    """返回 {dataset_name: bool} 的完整状态字典"""
+    return {name: check_dataset(name, data_dir) for name in _DATASET_MARKERS}
+
+
+def download_dataset(name: str, data_dir: str = './data'):
+    """下载指定数据集（仅下载，不做划分）"""
+    name = name.lower()
+    transform = transforms.ToTensor()
+    if name == 'mnist':
+        datasets.MNIST(data_dir, train=True, download=True, transform=transform)
+        datasets.MNIST(data_dir, train=False, download=True, transform=transform)
+    elif name == 'cifar10':
+        datasets.CIFAR10(data_dir, train=True, download=True, transform=transform)
+        datasets.CIFAR10(data_dir, train=False, download=True, transform=transform)
+    else:
+        raise ValueError(f"Unknown dataset: {name}")
+
 
 
 def dirichlet_partition(dataset, num_clients, alpha=0.1, num_classes=10):
@@ -61,8 +106,8 @@ def load_mnist(data_dir='./data', num_clients=20, alpha=0.1, batch_size=32, num_
         transforms.Normalize((0.1307,), (0.3081,))
     ])
 
-    train_dataset = datasets.MNIST(data_dir, train=True, download=True, transform=transform)
-    test_dataset = datasets.MNIST(data_dir, train=False, download=True, transform=transform)
+    train_dataset = datasets.MNIST(data_dir, train=True, download=False, transform=transform)
+    test_dataset = datasets.MNIST(data_dir, train=False, download=False, transform=transform)
 
     # Non-IID划分
     client_indices = dirichlet_partition(train_dataset, num_clients, alpha=alpha, num_classes=10)
@@ -116,8 +161,8 @@ def load_cifar10(data_dir='./data', num_clients=20, alpha=0.1, batch_size=32, nu
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
     ])
 
-    train_dataset = datasets.CIFAR10(data_dir, train=True, download=True, transform=transform_train)
-    test_dataset = datasets.CIFAR10(data_dir, train=False, download=True, transform=transform_test)
+    train_dataset = datasets.CIFAR10(data_dir, train=True, download=False, transform=transform_train)
+    test_dataset = datasets.CIFAR10(data_dir, train=False, download=False, transform=transform_test)
 
     # Non-IID划分
     client_indices = dirichlet_partition(train_dataset, num_clients, alpha=alpha, num_classes=10)

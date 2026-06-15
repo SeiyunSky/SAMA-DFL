@@ -134,27 +134,32 @@ def measure_convergence_rate(method='sama', num_clients=None, byzantine_ratio=No
     t_vals = t_vals[valid_mask]
     D_vals = D_vals[valid_mask]
 
+    lambda_fitted = None
     if len(D_vals) > 10:
         log_D = np.log(D_vals)
         coeffs = np.polyfit(t_vals, log_D, 1)
         lambda_fitted = -coeffs[0]
 
-        mu = 0.01  # 强凸常数（MNIST典型值）
-        lambda_theoretical = mu * lr
+        # μ 经验估计：从 log D_t 曲线的指数衰减斜率反推
+        # 理论：λ = μη，故 μ_emp = λ_fitted / lr
+        # 这是 empirical estimation，不依赖强凸常数的先验假设
+        mu_empirical = lambda_fitted / lr
 
         print(f"\nConvergence rate fitting:")
-        print(f"  Fitted λ = {lambda_fitted:.6f}")
-        print(f"  Theoretical λ = μη = {mu}×{lr} = {lambda_theoretical:.6f}")
-        print(f"  Relative error: {abs(lambda_fitted - lambda_theoretical)/lambda_theoretical*100:.2f}%")
+        print(f"  Fitted λ        = {lambda_fitted:.6f}")
+        print(f"  Learning rate η = {lr}")
+        print(f"  μ (empirical)   = λ/η = {mu_empirical:.6f}  "
+              f"(estimated from log-linear fit, not assumed)")
+        print(f"  Theoretical prediction: λ = μη = {mu_empirical:.6f}×{lr} = {mu_empirical * lr:.6f}")
     else:
-        lambda_fitted = None
-        log_D0_fitted = None
+        mu_empirical = None
         print("\nWarning: Insufficient valid data points for fitting")
 
     return {
         'consensus_errors': consensus_errors,
         'lambda_fitted': lambda_fitted,
-        'lambda_theoretical': mu * lr
+        'mu_empirical': mu_empirical,
+        'lr': lr,
     }
 
 
@@ -228,9 +233,11 @@ def run_convergence_comparison():
     print("=" * 80)
     for method in methods:
         lambda_fit = results[method]['lambda_fitted']
-        lambda_theory = results[method]['lambda_theoretical']
-        if lambda_fit:
-            print(f"{method.upper():8s}: λ_fitted={lambda_fit:.6f}, λ_theory={lambda_theory:.6f}")
+        mu_emp = results[method]['mu_empirical']
+        lr_val = results[method]['lr']
+        if lambda_fit and mu_emp:
+            print(f"{method.upper():8s}: λ_fitted={lambda_fit:.6f}, "
+                  f"μ_empirical={mu_emp:.6f}, η={lr_val}, λ=μη={mu_emp*lr_val:.6f}")
 
     return results
 

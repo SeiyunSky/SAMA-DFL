@@ -20,7 +20,7 @@ class SAMAAggregator(BaseAggregator):
     """
 
     def __init__(self, alpha=0.5, tau_max=1.0, tau_min=0.01, use_temperature=False,
-                 trust_layers=None, adaptive_alpha=False, eps=1e-8):
+                 trust_layers=None, eps=1e-8):
         """
         参数:
             alpha: 自锚定权重 (默认0.5，理论最优)
@@ -29,17 +29,13 @@ class SAMAAggregator(BaseAggregator):
             use_temperature: 是否使用温度退火 (默认False)
             trust_layers: 用于计算方向信任的层名列表 (默认None=全部参数)
                           例如 ['fc2.weight', 'fc2.bias'] 只用分类头计算余弦相似度
-            adaptive_alpha: 是否根据信任分自适应调整α (默认False)
-                           高威胁(低信任)→增大α，低威胁(高信任)→减小α
             eps: 数值稳定性参数
         """
-        super().__init__(name="SAMA-DFL")
-        self.alpha = alpha
+        super().__init__(name="SAMA-DFL", alpha=alpha)
         self.tau_max = tau_max
         self.tau_min = tau_min
         self.use_temperature = use_temperature
         self.trust_layers = trust_layers
-        self.adaptive_alpha = adaptive_alpha
         self.eps = eps
 
     def compute_temperature(self, t, T):
@@ -179,39 +175,6 @@ class SAMAAggregator(BaseAggregator):
             return agg_model, stats
 
         return agg_model
-
-    def final_update(self, local_model, aggregated_model, alpha=None, avg_trust=None):
-        """
-        自锚定融合
-        w_i^{t+1} = α·w_i' + (1-α)·AGG_i
-
-        参数:
-            local_model: OrderedDict - 本地训练后的模型
-            aggregated_model: OrderedDict - 聚合后的模型
-            alpha: float - 自锚权重（如果为None则使用初始化的值）
-            avg_trust: float - 平均信任分（用于自适应α，可选）
-
-        返回:
-            OrderedDict - 融合后的最终模型
-        """
-        if alpha is None:
-            alpha = self.alpha
-
-        # 自适应α：信任低时更信任自身，信任高时更信任邻居
-        if self.adaptive_alpha and avg_trust is not None:
-            # avg_trust ∈ [0, 1]，映射到 α ∈ [0.3, 0.8]
-            # 高信任(1.0) → α=0.3（多用邻居），低信任(0.0) → α=0.8（多用自身）
-            alpha = 0.8 - 0.5 * avg_trust
-
-        final_state = OrderedDict()
-        for key in local_model.keys():
-            if isinstance(local_model[key], torch.Tensor):
-                final_state[key] = (alpha * local_model[key] +
-                                   (1 - alpha) * aggregated_model[key])
-            else:
-                final_state[key] = local_model[key]
-
-        return final_state
 
 
 # 使用示例

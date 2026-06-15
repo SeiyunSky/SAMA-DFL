@@ -9,6 +9,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from pathlib import Path
 import sys
+import os
 import yaml
 from tqdm import tqdm
 
@@ -16,10 +17,12 @@ sys.path.append(str(Path(__file__).parent.parent.parent))
 
 plt.rcParams['font.family'] = 'DejaVu Sans'
 
-from aggregators import SAMAAggregator, BALANCEAggregator, SCCLIPAggregator
+from aggregators import (SAMAAggregator, BALANCEAggregator, SCCLIPAggregator,
+                         FedAvgAggregator, KrumAggregator, TrimmedMeanAggregator,
+                         CoordMedianAggregator)
 from models import SimpleCNN
 from utils import load_mnist, generate_ring_topology
-from attacks import GaussianAttack, LabelFlippingAttack, OmniscientAttack
+from attacks import GaussianAttack, LabelFlippingAttack, OmniscientAttack, KrumAttack, TrimAttack
 from collections import OrderedDict
 
 
@@ -59,14 +62,20 @@ class FederatedTrainer:
 
         print(f"Honest nodes: {len(self.honest_nodes)}, Byzantine nodes: {len(self.byzantine_nodes)}")
 
-        # 攻击
-        attack_type = config['attack']['type']
+        # 攻击（环境变量 ATTACK_TYPE 可覆盖配置文件）
+        attack_type = os.getenv('ATTACK_TYPE', config['attack']['type'])
         if attack_type == 'gaussian':
             self.attack = GaussianAttack(std=config['attack']['gaussian_std'])
         elif attack_type == 'label_flipping':
             self.attack = LabelFlippingAttack(num_classes=10)
         elif attack_type == 'omniscient':
             self.attack = OmniscientAttack(amplification=config['attack'].get('amplification', 2.0))
+        elif attack_type == 'krum_attack':
+            self.attack = KrumAttack(num_byzantine=num_byzantine,
+                                     amplification=config['attack'].get('amplification', 1.0))
+        elif attack_type == 'trim_attack':
+            self.attack = TrimAttack(num_byzantine=num_byzantine,
+                                     trim_ratio=config['attack'].get('trim_ratio', 0.1))
         else:
             self.attack = None
 
@@ -75,7 +84,7 @@ class FederatedTrainer:
         训练主循环
 
         参数:
-            method: 'sama', 'balance', 'scclip'
+            method: 'sama' | 'balance' | 'scclip' | 'fedavg' | 'krum' | 'multi_krum' | 'trimmed_mean' | 'coord_median'
 
         返回:
             dict - 训练历史
@@ -93,7 +102,6 @@ class FederatedTrainer:
                 tau_max=self.config['sama']['tau_max'],
                 tau_min=self.config['sama']['tau_min'],
                 trust_layers=self.config['sama'].get('trust_layers', None),
-                adaptive_alpha=self.config['sama'].get('adaptive_alpha', False)
             )
         elif method == 'balance':
             aggregator = BALANCEAggregator(
@@ -106,6 +114,30 @@ class FederatedTrainer:
                 alpha=self.config['scclip']['alpha'],
                 clip_constant=self.config['scclip']['clip_constant']
             )
+        elif method == 'fedavg':
+            aggregator = FedAvgAggregator(
+                alpha=self.config['fedavg']['alpha']
+            )
+        elif method == 'krum':
+            aggregator = KrumAggregator(
+                alpha=self.config['krum']['alpha'],
+                byzantine_ratio=self.config['krum']['byzantine_ratio']
+            )
+        elif method == 'multi_krum':
+            aggregator = KrumAggregator(
+                alpha=self.config['multi_krum']['alpha'],
+                multi_k=self.config['multi_krum']['multi_k'],
+                byzantine_ratio=self.config['multi_krum']['byzantine_ratio']
+            )
+        elif method == 'trimmed_mean':
+            aggregator = TrimmedMeanAggregator(
+                alpha=self.config['trimmed_mean']['alpha'],
+                trim_ratio=self.config['trimmed_mean']['trim_ratio']
+            )
+        elif method == 'coord_median':
+            aggregator = CoordMedianAggregator(
+                alpha=self.config['coord_median']['alpha']
+            )
         else:
             raise ValueError(f"Unknown method: {method}")
 
@@ -114,7 +146,6 @@ class FederatedTrainer:
             'test_loss': [],
             'test_acc': [],
             'consensus_error': [],
-            'byzantine_influence': []
         }
 
         num_rounds = self.config['federated']['num_rounds']
@@ -161,13 +192,11 @@ class FederatedTrainer:
 
             # 拜占庭攻击（非Label Flipping类型在训练后修改模型参数）
             if self.attack and not isinstance(self.attack, LabelFlippingAttack):
-                if isinstance(self.attack, OmniscientAttack):
-                    # Omniscient: 利用所有诚实模型生成恶意模型
-                    honest_models = [local_models[i] for i in self.honest_nodes]
+                honest_models = [local_models[i] for i in self.honest_nodes]
+                if isinstance(self.attack, (OmniscientAttack, KrumAttack, TrimAttack)):
                     for byz_id in self.byzantine_nodes:
                         local_models[byz_id] = self.attack.attack(honest_models)
                 else:
-                    # Gaussian等: 逐个修改拜占庭模型
                     for byz_id in self.byzantine_nodes:
                         local_models[byz_id] = self.attack.attack(local_models[byz_id])
 
@@ -260,7 +289,7 @@ def run_mnist_experiment(config_path=None):
     trainer = FederatedTrainer(config)
 
     # 训练多个方法
-    methods = ['sama', 'balance', 'scclip']
+    methods = ['sama', 'balance', 'scclip', 'fedavg', 'krum', 'multi_krum', 'trimmed_mean', 'coord_median']
     results = {}
 
     for method in methods:
@@ -277,7 +306,11 @@ def run_mnist_experiment(config_path=None):
                  fontsize=13, fontweight='bold')
 
     log_interval = config['logging']['log_interval']
-    colors = {'sama': 'C0', 'balance': 'C1', 'scclip': 'C2'}
+    colors = {
+        'sama': 'C0', 'balance': 'C1', 'scclip': 'C2',
+        'fedavg': 'C3', 'krum': 'C4', 'multi_krum': 'C5',
+        'trimmed_mean': 'C6', 'coord_median': 'C7'
+    }
 
     # Top-left: Test loss
     for method in methods:

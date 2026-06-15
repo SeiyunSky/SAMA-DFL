@@ -25,8 +25,7 @@ class BALANCEAggregator(BaseAggregator):
             gamma: 基础阈值系数
             kappa: 衰减速率
         """
-        super().__init__(name="BALANCE")
-        self.alpha = alpha
+        super().__init__(name="BALANCE", alpha=alpha)
         self.gamma = gamma
         self.kappa = kappa
 
@@ -69,13 +68,13 @@ class BALANCEAggregator(BaseAggregator):
                 accepted.append(neighbor)
 
         if not accepted:
-            # 无邻居通过，返回自身
             if return_stats:
                 stats = {
                     'num_neighbors': len(neighbor_models),
                     'num_accepted': 0,
                     'threshold': threshold,
-                    'avg_distance': np.mean(distances)
+                    'avg_distance': np.mean(distances),
+                    'avg_trust': 0.0,
                 }
                 return own_model, stats
             return own_model
@@ -85,28 +84,15 @@ class BALANCEAggregator(BaseAggregator):
         agg_model = self.vector_to_model(agg_vec, own_model)
 
         if return_stats:
+            accept_rate = len(accepted) / len(neighbor_models)
             stats = {
                 'num_neighbors': len(neighbor_models),
                 'num_accepted': len(accepted),
                 'threshold': threshold,
                 'avg_distance': np.mean(distances),
-                'acceptance_rate': len(accepted) / len(neighbor_models)
+                'acceptance_rate': accept_rate,
+                'avg_trust': accept_rate,
             }
             return agg_model, stats
 
         return agg_model
-
-    def final_update(self, local_model, aggregated_model, alpha=None, **kwargs):
-        """自锚定融合"""
-        if alpha is None:
-            alpha = self.alpha
-
-        final_state = OrderedDict()
-        for key in local_model.keys():
-            if isinstance(local_model[key], torch.Tensor):
-                final_state[key] = (alpha * local_model[key] +
-                                   (1 - alpha) * aggregated_model[key])
-            else:
-                final_state[key] = local_model[key]
-
-        return final_state

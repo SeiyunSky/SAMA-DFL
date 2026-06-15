@@ -9,8 +9,23 @@ import torch
 class BaseAggregator(ABC):
     """基础聚合器抽象类"""
 
-    def __init__(self, name="BaseAggregator"):
+    def __init__(self, name="BaseAggregator", alpha=0.5):
         self.name = name
+        self.alpha = alpha
+
+    def final_update(self, local_model, aggregated_model, alpha=None, **kwargs):
+        """
+        自锚定融合: w_i^{t+1} = α·w_i' + (1-α)·AGG_i
+        """
+        if alpha is None:
+            alpha = self.alpha
+        final_state = OrderedDict()
+        for key in local_model.keys():
+            if isinstance(local_model[key], torch.Tensor):
+                final_state[key] = alpha * local_model[key] + (1 - alpha) * aggregated_model[key]
+            else:
+                final_state[key] = local_model[key]
+        return final_state
 
     @abstractmethod
     def aggregate(self, own_model, neighbor_models, **kwargs):

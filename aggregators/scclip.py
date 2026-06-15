@@ -28,8 +28,7 @@ class SCCLIPAggregator(BaseAggregator):
             alpha: 自锚定权重
             clip_constant: 裁剪常数C，控制裁剪半径
         """
-        super().__init__(name="SCCLIP")
-        self.alpha = alpha
+        super().__init__(name="SCCLIP", alpha=alpha)
         self.clip_constant = clip_constant
 
     def aggregate(self, own_model, neighbor_models, t=0, T=100, return_stats=False):
@@ -77,35 +76,23 @@ class SCCLIPAggregator(BaseAggregator):
         if torch.isnan(avg_clipped).any() or torch.isinf(avg_clipped).any():
             if return_stats:
                 return own_model, {'num_neighbors': len(neighbor_models), 'num_clipped': num_clipped,
-                                  'clip_radius': tau, 'avg_distance': np.mean(distances), 'clip_rate': 0.0}
+                                  'clip_radius': tau, 'avg_distance': np.mean(distances),
+                                  'clip_rate': 0.0, 'avg_trust': None}
             return own_model
 
         agg_vec = w_i_vec + avg_clipped
         agg_model = self.vector_to_model(agg_vec, own_model)
 
         if return_stats:
+            clip_rate = num_clipped / len(neighbor_models)
             stats = {
                 'num_neighbors': len(neighbor_models),
                 'num_clipped': num_clipped,
                 'clip_radius': tau,
                 'avg_distance': np.mean(distances),
-                'clip_rate': num_clipped / len(neighbor_models)
+                'clip_rate': clip_rate,
+                'avg_trust': 1.0 - clip_rate,
             }
             return agg_model, stats
 
         return agg_model
-
-    def final_update(self, local_model, aggregated_model, alpha=None, **kwargs):
-        """自锚定融合"""
-        if alpha is None:
-            alpha = self.alpha
-
-        final_state = OrderedDict()
-        for key in local_model.keys():
-            if isinstance(local_model[key], torch.Tensor):
-                final_state[key] = (alpha * local_model[key] +
-                                   (1 - alpha) * aggregated_model[key])
-            else:
-                final_state[key] = local_model[key]
-
-        return final_state

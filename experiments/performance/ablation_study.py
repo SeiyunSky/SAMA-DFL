@@ -9,8 +9,10 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from pathlib import Path
 import sys
+import os
 import yaml
 import copy
+import multiprocessing
 from tqdm import tqdm
 
 sys.path.append(str(Path(__file__).parent.parent.parent))
@@ -21,7 +23,7 @@ from aggregators import SAMAAggregator
 from models import SimpleCNN
 from utils import load_mnist, generate_ring_topology
 from utils.topology import generate_mesh_topology
-from attacks import GaussianAttack, LabelFlippingAttack, OmniscientAttack
+from attacks import GaussianAttack, LabelFlippingAttack, OmniscientAttack, KrumAttack, TrimAttack
 from collections import OrderedDict
 
 
@@ -38,7 +40,7 @@ def train_ablation_run(config, aggregator, device):
         num_clients=num_clients,
         alpha=config['data']['non_iid_alpha'],
         batch_size=config['federated']['batch_size'],
-        num_workers=config['federated'].get('num_workers', 0)
+        num_workers=config['federated'].get('num_workers', multiprocessing.cpu_count())
     )
 
     topology_type = config['topology']['type']
@@ -51,7 +53,7 @@ def train_ablation_run(config, aggregator, device):
     honest_nodes = list(range(num_clients - num_byzantine))
     byzantine_nodes = list(range(num_clients - num_byzantine, num_clients))
 
-    attack_type = config['attack']['type']
+    attack_type = os.getenv('ATTACK_TYPE', config['attack']['type'])
     if attack_type == 'gaussian':
         attack = GaussianAttack(std=config['attack']['gaussian_std'])
     elif attack_type == 'label_flipping':
@@ -93,8 +95,8 @@ def train_ablation_run(config, aggregator, device):
             local_models.append(model.state_dict())
 
         if attack and not isinstance(attack, LabelFlippingAttack):
-            if isinstance(attack, OmniscientAttack):
-                honest_models = [local_models[i] for i in honest_nodes]
+            honest_models = [local_models[i] for i in honest_nodes]
+            if isinstance(attack, (OmniscientAttack, KrumAttack, TrimAttack)):
                 for byz_id in byzantine_nodes:
                     local_models[byz_id] = attack.attack(honest_models)
             else:
@@ -238,6 +240,65 @@ class NoDirectionAggregator(SAMAAggregator):
         return agg_model
 
 
+class HardThresholdAggregator(SAMAAggregator):
+    """
+    SAMA 硬阈值变体：方向余弦 > 0 的邻居全部接受（均等权重），不使用软加权。
+    对比软加权（φ_j = cos_sim），验证连续权重 vs 二值权重的差异。
+    """
+
+    def aggregate(self, own_model, neighbor_models, t=0, T=100, return_stats=False):
+        if not neighbor_models:
+            if return_stats:
+                return own_model, {'num_neighbors': 0, 'num_filtered': 0, 'avg_trust': 0.0}
+            return own_model
+
+        w_i_vec = self.model_to_vector(own_model)
+        w_i_norm = torch.norm(w_i_vec)
+        if w_i_norm < self.eps:
+            if return_stats:
+                return own_model, {'avg_trust': 0.0}
+            return own_model
+
+        w_i_trust = self._extract_trust_vector(own_model)
+        w_i_trust_norm = torch.norm(w_i_trust)
+        neighbor_trust_vecs = [self._extract_trust_vector(m) for m in neighbor_models]
+
+        accepted_aligned = []
+        num_accepted = 0
+        for idx, m in enumerate(neighbor_models):
+            w_j_vec = self.model_to_vector(m)
+            w_j_norm = torch.norm(w_j_vec)
+            if w_j_norm < self.eps:
+                continue
+            w_j_trust = neighbor_trust_vecs[idx]
+            w_j_trust_norm = torch.norm(w_j_trust)
+            if w_j_trust_norm < self.eps or w_i_trust_norm < self.eps:
+                continue
+            cos_sim = torch.dot(w_i_trust, w_j_trust) / (w_i_trust_norm * w_j_trust_norm)
+            if cos_sim.item() > 0:
+                # 幅度对齐，均等权重
+                aligned = w_i_norm * (w_j_vec / w_j_norm)
+                accepted_aligned.append(aligned)
+                num_accepted += 1
+
+        if not accepted_aligned:
+            if return_stats:
+                return own_model, {'num_neighbors': len(neighbor_models),
+                                   'num_filtered': len(neighbor_models), 'avg_trust': 0.0}
+            return own_model
+
+        agg_vec = torch.stack(accepted_aligned).mean(dim=0)
+        agg_model = self.vector_to_model(agg_vec, own_model)
+
+        if return_stats:
+            return agg_model, {
+                'num_neighbors': len(neighbor_models),
+                'num_filtered': len(neighbor_models) - num_accepted,
+                'avg_trust': num_accepted / len(neighbor_models),
+            }
+        return agg_model
+
+
 def run_ablation_study(config_path=None):
     """
     Ablation study: disable each SAMA component one at a time.
@@ -263,7 +324,7 @@ def run_ablation_study(config_path=None):
         ),
         'No trust_layers': SAMAAggregator(
             alpha=sama_cfg['alpha'],
-            trust_layers=None,  # Use full model for cos similarity
+            trust_layers=None,
         ),
         'No alignment': NoAlignAggregator(
             alpha=sama_cfg['alpha'],
@@ -273,7 +334,11 @@ def run_ablation_study(config_path=None):
             alpha=sama_cfg['alpha'],
         ),
         'No self-anchor': SAMAAggregator(
-            alpha=0.0,  # alpha=0 means fully trust aggregation
+            alpha=0.0,
+            trust_layers=sama_cfg.get('trust_layers', None),
+        ),
+        'Hard threshold': HardThresholdAggregator(
+            alpha=sama_cfg['alpha'],
             trust_layers=sama_cfg.get('trust_layers', None),
         ),
     }
@@ -288,7 +353,7 @@ def run_ablation_study(config_path=None):
     # Plot
     fig, ax = plt.subplots(figsize=(10, 6))
 
-    attack_type = config['attack']['type']
+    attack_type = os.getenv('ATTACK_TYPE', config['attack']['type'])
     byz_ratio = config['federated']['byzantine_ratio']
     noniid_alpha = config['data']['non_iid_alpha']
     fig.suptitle(f"Ablation Study | Attack={attack_type} | Byzantine={byz_ratio:.0%} | α={noniid_alpha}",

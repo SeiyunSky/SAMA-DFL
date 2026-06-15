@@ -5,46 +5,51 @@ experiment:
   seed: 42
   device: "cuda"
 
+# 联邦学习配置
 federated:
   num_clients: 20
-  byzantine_ratio: 0.3           # 30% 拜占庭（6/20）— 更高攻击压力下SAMA方向筛选优势更大
+  byzantine_ratio: 0.2
   num_rounds: 150
   local_epochs: 1
   batch_size: 128
-  num_workers: 2
+  num_workers: 4
 
+# 数据配置
 data:
   dataset: "mnist"
   data_dir: "./data"
-  non_iid_alpha: 0.05            # 极端Non-IID — 幅度对齐的价值更高
+  non_iid_alpha: 0.1
 
+# 网络拓扑
 topology:
   type: "mesh"
-  degree: 6                      # 每个节点6邻居，SAMA有足够样本做方向筛选
+  degree: 6
 
+# 模型配置
 model:
   name: "simple_cnn"
   num_classes: 10
 
+# 优化器配置
 optimizer:
   type: "sgd"
-  lr: 0.01                       # 保守学习率，避免不稳定
+  lr: 0.01
   momentum: 0.0
   weight_decay: 0.0
 
 # SAMA-DFL
 sama:
   alpha: 0.5
-  use_temperature: true
+  use_temperature: false
   tau_max: 1.0
   tau_min: 0.01
   trust_layers: ["fc2.weight", "fc2.bias"]
-  adaptive_alpha: true
+  adaptive_alpha: false
 
-# BALANCE — 给它公平的参数
+# BALANCE
 balance:
   alpha: 0.5
-  gamma: 1.5                     # 让它能接受邻居（太小它不工作，不公平）
+  gamma: 3.0
   kappa: 0.1
 
 # SCCLIP
@@ -52,19 +57,43 @@ scclip:
   alpha: 0.5
   clip_constant: 0.1
 
-# Attack
+# FedAvg
+fedavg:
+  alpha: 0.5
+
+# Krum / Multi-Krum
+krum:
+  alpha: 0.5
+  byzantine_ratio: 0.2
+
+multi_krum:
+  alpha: 0.5
+  byzantine_ratio: 0.2
+  multi_k: 5
+
+# Trimmed Mean
+trimmed_mean:
+  alpha: 0.5
+  trim_ratio: 0.1
+
+# Coordinate Median
+coord_median:
+  alpha: 0.5
+
+# 攻击配置
 attack:
-  type: "label_flipping"         # 方向性攻击 — SAMA的方向筛选主战场
+  type: "label_flipping"
   gaussian_std: 10.0
   amplification: 2.0
+  trim_ratio: 0.1
 
-# Logging
+# 日志配置
 logging:
   log_interval: 10
   save_model: false
   save_dir: "./results"
 
-# Theory verification (used by experiments/theory_verification/*.py)
+# 理论验证实验配置
 theory_verification:
   skip_initial_rounds: 10
   measurement_rounds: 100
