@@ -31,7 +31,7 @@ from attacks import GaussianAttack, LabelFlippingAttack, OmniscientAttack, KrumA
 from collections import OrderedDict
 
 
-def create_aggregator(method, config):
+def create_aggregator(method, config, model_template=None):
     """Create aggregator by method name."""
     if method == 'sama':
         return SAMAAggregator(
@@ -40,6 +40,7 @@ def create_aggregator(method, config):
             tau_max=config['sama'].get('tau_max', 1.0),
             tau_min=config['sama'].get('tau_min', 0.01),
             trust_layers=config['sama'].get('trust_layers', None),
+            model_template=model_template,
         )
     elif method == 'balance':
         return BALANCEAggregator(
@@ -134,7 +135,7 @@ def train_single_run(config, method, device, neighbors=None, progress_queue=None
     # Models and aggregator
     models = [SimpleCNN().to(device) for _ in range(num_clients)]
     optimizers = [torch.optim.SGD(m.parameters(), lr=lr) for m in models]
-    aggregator = create_aggregator(method, config)
+    aggregator = create_aggregator(method, config, model_template=models[0])
 
     # Training
     for t in range(num_rounds):
@@ -326,7 +327,7 @@ def run_byzantine_sweep(config_path=None):
             label = f"byz{int(byz_ratio*100)}%/{method.upper()}"
             tasks.append((byz_ratio, method, config, label))
 
-    max_workers = min(len(tasks), 4)
+    max_workers = min(len(tasks), int(os.getenv('TABLE_WORKERS', base_config.get('experiment', {}).get('parallel_workers', 4))))
 
     def submit_fn(executor, task, queue):
         byz_ratio, method, config, label = task
@@ -458,7 +459,7 @@ def run_noniid_sweep(config_path=None):
             label = f"α={alpha_val}/{method.upper()}"
             tasks.append((alpha_val, method, config, label))
 
-    max_workers = min(len(tasks), 4)
+    max_workers = min(len(tasks), int(os.getenv('TABLE_WORKERS', base_config.get('experiment', {}).get('parallel_workers', 4))))
 
     def submit_fn(executor, task, queue):
         alpha_val, method, config, label = task

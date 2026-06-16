@@ -111,6 +111,7 @@ class FederatedTrainer:
                 tau_max=self.config['sama']['tau_max'],
                 tau_min=self.config['sama']['tau_min'],
                 trust_layers=self.config['sama'].get('trust_layers', None),
+                model_template=models[0],
             )
         elif method == 'balance':
             aggregator = BALANCEAggregator(

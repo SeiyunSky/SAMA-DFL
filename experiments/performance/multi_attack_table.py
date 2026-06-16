@@ -302,7 +302,7 @@ def _run_table(base_config, dataset_name, save_dir):
     results = np.zeros((len(METHOD_KEYS), len(ATTACK_KEYS)))
     histories = [[None] * len(ATTACK_KEYS) for _ in range(len(METHOD_KEYS))]
 
-    max_workers = int(os.getenv('TABLE_WORKERS', 4))
+    max_workers = int(os.getenv('TABLE_WORKERS', base_config.get('experiment', {}).get('parallel_workers', 4)))
 
     mgr = multiprocessing.Manager()
     progress_queue = mgr.Queue()

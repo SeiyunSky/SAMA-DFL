@@ -22,17 +22,20 @@ class SAMAAggregator(BaseAggregator):
     def _compute_trust_slices(self, model_template):
         """
         Compute (start, end) index pairs for trust_layers in the flat parameter vector.
-        Uses model.parameters() order, which matches model_to_vector(nn.Module).
+        Iterates model.parameters() (same order as model_to_vector) and uses
+        named_parameters() in parallel only for name lookup — buffers are excluded
+        from both, so indices are always consistent.
         Called once at init time; requires a model_template instance.
         Returns None if trust_layers is None or model_template is not provided.
         """
         if self.trust_layers is None or model_template is None:
             return None
+        trust_set = set(self.trust_layers)
         slices = []
         idx = 0
         for name, param in model_template.named_parameters():
             n = param.numel()
-            if name in self.trust_layers:
+            if name in trust_set:
                 slices.append((idx, idx + n))
             idx += n
         return slices if slices else None
@@ -68,7 +71,10 @@ class SAMAAggregator(BaseAggregator):
         w_i_trust = self._extract_trust_vec(own_vec)
         w_i_trust_norm = torch.norm(w_i_trust)
 
-        neighbor_trust = torch.stack([self._extract_trust_vec(neighbor_mat[i]) for i in range(N)])
+        if self._trust_slices is None:
+            neighbor_trust = neighbor_mat
+        else:
+            neighbor_trust = torch.stack([self._extract_trust_vec(neighbor_mat[i]) for i in range(N)])
         neighbor_trust_norms = torch.norm(neighbor_trust, dim=1)
         neighbor_norms = torch.norm(neighbor_mat, dim=1)
 

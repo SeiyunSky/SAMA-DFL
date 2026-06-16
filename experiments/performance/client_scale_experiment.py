@@ -51,12 +51,13 @@ def _build_attack(attack_key, num_byzantine, config):
         raise ValueError(f"Unknown attack: {attack_key}")
 
 
-def _create_aggregator(method, config):
+def _create_aggregator(method, config, model_template=None):
     if method == 'sama':
         return SAMAAggregator(
             alpha=config['sama']['alpha'],
             use_temperature=config['sama'].get('use_temperature', False),
             trust_layers=config['sama'].get('trust_layers', None),
+            model_template=model_template,
         )
     elif method == 'balance':
         return BALANCEAggregator(
@@ -121,10 +122,10 @@ def _train_one(config, method, device, neighbors=None, progress_queue=None, task
 
     attack_key = os.getenv('ATTACK_TYPE', config['attack']['type'])
     attack = _build_attack(attack_key, num_byzantine, config)
-    aggregator = _create_aggregator(method, config)
 
     models = [SimpleCNN().to(device) for _ in range(num_clients)]
     optimizers = [torch.optim.SGD(m.parameters(), lr=lr) for m in models]
+    aggregator = _create_aggregator(method, config, model_template=models[0])
 
     for t in range(num_rounds):
         local_vecs = [None] * num_clients
@@ -276,7 +277,7 @@ def run_client_scale_experiment(config_path=None):
             label = f"n={n}/{method.upper()}"
             tasks.append((n, method, config, label))
 
-    max_workers = min(len(tasks), 4)
+    max_workers = min(len(tasks), int(os.getenv('TABLE_WORKERS', 4)))
     print(f"\n  Running {len(tasks)} tasks with {max_workers} workers in parallel...")
 
     mgr = multiprocessing.Manager()

@@ -4,6 +4,7 @@ experiment:
   name: "sama_dfl"
   seed: 42
   device: "cuda"
+  parallel_workers: 2
 
 # 联邦学习配置
 federated:

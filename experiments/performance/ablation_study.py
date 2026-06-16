@@ -150,100 +150,99 @@ def train_ablation_run(config, aggregator, device):
 class NoAlignAggregator(SAMAAggregator):
     """SAMA without magnitude alignment — uses raw neighbor vectors for aggregation."""
 
-    def aggregate(self, own_model, neighbor_models, t=0, T=100, return_stats=False):
-        if not neighbor_models:
-            if return_stats:
-                return own_model, {'num_neighbors': 0, 'num_filtered': 0, 'avg_trust': 0.0}
-            return own_model
+    def aggregate(self, own_vec, neighbor_vecs, t=0, T=100, return_stats=False, **kwargs):
+        if isinstance(neighbor_vecs, list):
+            if not neighbor_vecs:
+                if return_stats:
+                    return own_vec, {'num_neighbors': 0, 'num_filtered': 0, 'avg_trust': 0.0}
+                return own_vec
+            neighbor_mat = torch.stack(neighbor_vecs)
+        else:
+            neighbor_mat = neighbor_vecs
 
-        w_i_vec = self.model_to_vector(own_model)
-        w_i_norm = torch.norm(w_i_vec)
+        N = neighbor_mat.shape[0]
+        w_i_norm = torch.norm(own_vec)
         if w_i_norm < self.eps:
             if return_stats:
-                return own_model, {'avg_trust': 0.0}
-            return own_model
+                return own_vec, {'num_neighbors': N, 'num_filtered': N, 'avg_trust': 0.0}
+            return own_vec
 
-        neighbor_vecs = [self.model_to_vector(m) for m in neighbor_models]
-        w_i_trust = self._extract_trust_vector(own_model)
+        w_i_trust = self._extract_trust_vec(own_vec)
         w_i_trust_norm = torch.norm(w_i_trust)
-        neighbor_trust_vecs = [self._extract_trust_vector(m) for m in neighbor_models]
 
-        trust_scores = []
-        raw_vecs = []
-        for idx, w_j_vec in enumerate(neighbor_vecs):
-            w_j_norm = torch.norm(w_j_vec)
-            if w_j_norm < self.eps:
-                trust_scores.append(0.0)
-                raw_vecs.append(None)
-                continue
-            w_j_trust = neighbor_trust_vecs[idx]
-            w_j_trust_norm = torch.norm(w_j_trust)
-            if w_j_trust_norm < self.eps or w_i_trust_norm < self.eps:
-                trust_scores.append(0.0)
-                raw_vecs.append(None)
-                continue
-            cos_sim = torch.dot(w_i_trust, w_j_trust) / (w_i_trust_norm * w_j_trust_norm)
-            phi_j = max(0.0, cos_sim.item())
-            trust_scores.append(phi_j)
-            raw_vecs.append(w_j_vec if phi_j > 0 else None)
+        if self._trust_slices is None:
+            neighbor_trust = neighbor_mat
+        else:
+            neighbor_trust = torch.stack([self._extract_trust_vec(neighbor_mat[i]) for i in range(N)])
+        neighbor_trust_norms = torch.norm(neighbor_trust, dim=1)
+        neighbor_norms = torch.norm(neighbor_mat, dim=1)
 
-        valid_indices = [i for i, s in enumerate(trust_scores) if s > 0]
-        if not valid_indices:
+        valid_mask = (neighbor_norms >= self.eps) & (neighbor_trust_norms >= self.eps) & (w_i_trust_norm >= self.eps)
+        cos_sims = torch.zeros(N, device=own_vec.device)
+        if valid_mask.any():
+            dots = (neighbor_trust[valid_mask] * w_i_trust).sum(dim=1)
+            cos_sims[valid_mask] = dots / (neighbor_trust_norms[valid_mask] * w_i_trust_norm)
+
+        phi = torch.clamp(cos_sims, min=0.0)
+        valid = (phi > 0) & valid_mask
+
+        if not valid.any():
             if return_stats:
-                return own_model, {'num_neighbors': len(neighbor_models), 'num_filtered': len(neighbor_models), 'avg_trust': 0.0}
-            return own_model
+                return own_vec, {'num_neighbors': N, 'num_filtered': N, 'avg_trust': 0.0}
+            return own_vec
 
-        valid_scores = [trust_scores[i] for i in valid_indices]
-        valid_vecs = [raw_vecs[i] for i in valid_indices]
-        total_weight = sum(valid_scores) + self.eps
-        agg_vec = sum(s * v for s, v in zip(valid_scores, valid_vecs)) / total_weight
-        agg_model = self.vector_to_model(agg_vec, own_model)
+        # 无幅度对齐：直接用原始邻居向量加权
+        valid_vecs = neighbor_mat[valid]
+        valid_phi = phi[valid]
+        total_weight = valid_phi.sum() + self.eps
+        agg_vec = (valid_phi.unsqueeze(1) * valid_vecs).sum(dim=0) / total_weight
 
         if return_stats:
-            return agg_model, {'num_neighbors': len(neighbor_models),
-                              'num_filtered': len(neighbor_models) - len(valid_indices),
-                              'avg_trust': np.mean(valid_scores)}
-        return agg_model
+            return agg_vec, {'num_neighbors': N,
+                             'num_filtered': N - int(valid.sum()),
+                             'avg_trust': valid_phi.mean().item()}
+        return agg_vec
 
 
 class NoDirectionAggregator(SAMAAggregator):
     """SAMA without direction filtering — accepts all neighbors equally."""
 
-    def aggregate(self, own_model, neighbor_models, t=0, T=100, return_stats=False):
-        if not neighbor_models:
-            if return_stats:
-                return own_model, {'num_neighbors': 0, 'avg_trust': 1.0}
-            return own_model
+    def aggregate(self, own_vec, neighbor_vecs, t=0, T=100, return_stats=False, **kwargs):
+        if isinstance(neighbor_vecs, list):
+            if not neighbor_vecs:
+                if return_stats:
+                    return own_vec, {'num_neighbors': 0, 'num_filtered': 0, 'avg_trust': 1.0}
+                return own_vec
+            neighbor_mat = torch.stack(neighbor_vecs)
+        else:
+            neighbor_mat = neighbor_vecs
 
-        w_i_vec = self.model_to_vector(own_model)
-        w_i_norm = torch.norm(w_i_vec)
+        N = neighbor_mat.shape[0]
+        w_i_norm = torch.norm(own_vec)
         if w_i_norm < self.eps:
             if return_stats:
-                return own_model, {'avg_trust': 1.0}
-            return own_model
+                return own_vec, {'num_neighbors': N, 'num_filtered': 0, 'avg_trust': 1.0}
+            return own_vec
 
-        # Magnitude alignment but equal weights (no cos filtering)
-        aligned_vecs = []
-        for m in neighbor_models:
-            w_j_vec = self.model_to_vector(m)
-            w_j_norm = torch.norm(w_j_vec)
-            if w_j_norm < self.eps:
-                continue
-            aligned = w_i_norm * (w_j_vec / w_j_norm)
-            aligned_vecs.append(aligned)
+        neighbor_norms = torch.norm(neighbor_mat, dim=1)
+        valid_mask = neighbor_norms >= self.eps
 
-        if not aligned_vecs:
+        if not valid_mask.any():
             if return_stats:
-                return own_model, {'num_neighbors': len(neighbor_models), 'avg_trust': 1.0}
-            return own_model
+                return own_vec, {'num_neighbors': N, 'num_filtered': N, 'avg_trust': 1.0}
+            return own_vec
 
-        agg_vec = torch.stack(aligned_vecs).mean(dim=0)
-        agg_model = self.vector_to_model(agg_vec, own_model)
+        # 幅度对齐，等权（无方向过滤）
+        valid_vecs = neighbor_mat[valid_mask]
+        valid_norms = neighbor_norms[valid_mask]
+        aligned = w_i_norm * (valid_vecs / valid_norms.unsqueeze(1))
+        agg_vec = aligned.mean(dim=0)
 
         if return_stats:
-            return agg_model, {'num_neighbors': len(neighbor_models),
-                              'num_filtered': 0, 'avg_trust': 1.0}
-        return agg_model
+            return agg_vec, {'num_neighbors': N,
+                             'num_filtered': 0,
+                             'avg_trust': 1.0}
+        return agg_vec
 
 
 class HardThresholdAggregator(SAMAAggregator):
@@ -252,57 +251,57 @@ class HardThresholdAggregator(SAMAAggregator):
     对比软加权（φ_j = cos_sim），验证连续权重 vs 二值权重的差异。
     """
 
-    def aggregate(self, own_model, neighbor_models, t=0, T=100, return_stats=False):
-        if not neighbor_models:
-            if return_stats:
-                return own_model, {'num_neighbors': 0, 'num_filtered': 0, 'avg_trust': 0.0}
-            return own_model
+    def aggregate(self, own_vec, neighbor_vecs, t=0, T=100, return_stats=False, **kwargs):
+        if isinstance(neighbor_vecs, list):
+            if not neighbor_vecs:
+                if return_stats:
+                    return own_vec, {'num_neighbors': 0, 'num_filtered': 0, 'avg_trust': 0.0}
+                return own_vec
+            neighbor_mat = torch.stack(neighbor_vecs)
+        else:
+            neighbor_mat = neighbor_vecs
 
-        w_i_vec = self.model_to_vector(own_model)
-        w_i_norm = torch.norm(w_i_vec)
+        N = neighbor_mat.shape[0]
+        w_i_norm = torch.norm(own_vec)
         if w_i_norm < self.eps:
             if return_stats:
-                return own_model, {'avg_trust': 0.0}
-            return own_model
+                return own_vec, {'num_neighbors': N, 'num_filtered': N, 'avg_trust': 0.0}
+            return own_vec
 
-        w_i_trust = self._extract_trust_vector(own_model)
+        w_i_trust = self._extract_trust_vec(own_vec)
         w_i_trust_norm = torch.norm(w_i_trust)
-        neighbor_trust_vecs = [self._extract_trust_vector(m) for m in neighbor_models]
 
-        accepted_aligned = []
-        num_accepted = 0
-        for idx, m in enumerate(neighbor_models):
-            w_j_vec = self.model_to_vector(m)
-            w_j_norm = torch.norm(w_j_vec)
-            if w_j_norm < self.eps:
-                continue
-            w_j_trust = neighbor_trust_vecs[idx]
-            w_j_trust_norm = torch.norm(w_j_trust)
-            if w_j_trust_norm < self.eps or w_i_trust_norm < self.eps:
-                continue
-            cos_sim = torch.dot(w_i_trust, w_j_trust) / (w_i_trust_norm * w_j_trust_norm)
-            if cos_sim.item() > 0:
-                # 幅度对齐，均等权重
-                aligned = w_i_norm * (w_j_vec / w_j_norm)
-                accepted_aligned.append(aligned)
-                num_accepted += 1
+        if self._trust_slices is None:
+            neighbor_trust = neighbor_mat
+        else:
+            neighbor_trust = torch.stack([self._extract_trust_vec(neighbor_mat[i]) for i in range(N)])
+        neighbor_trust_norms = torch.norm(neighbor_trust, dim=1)
+        neighbor_norms = torch.norm(neighbor_mat, dim=1)
 
-        if not accepted_aligned:
+        valid_mask = (neighbor_norms >= self.eps) & (neighbor_trust_norms >= self.eps) & (w_i_trust_norm >= self.eps)
+        cos_sims = torch.zeros(N, device=own_vec.device)
+        if valid_mask.any():
+            dots = (neighbor_trust[valid_mask] * w_i_trust).sum(dim=1)
+            cos_sims[valid_mask] = dots / (neighbor_trust_norms[valid_mask] * w_i_trust_norm)
+
+        # 硬阈值：cos > 0 则接受，均等权重
+        accept = (cos_sims > 0) & valid_mask
+        if not accept.any():
             if return_stats:
-                return own_model, {'num_neighbors': len(neighbor_models),
-                                   'num_filtered': len(neighbor_models), 'avg_trust': 0.0}
-            return own_model
+                return own_vec, {'num_neighbors': N, 'num_filtered': N, 'avg_trust': 0.0}
+            return own_vec
 
-        agg_vec = torch.stack(accepted_aligned).mean(dim=0)
-        agg_model = self.vector_to_model(agg_vec, own_model)
+        valid_vecs = neighbor_mat[accept]
+        valid_norms = neighbor_norms[accept]
+        aligned = w_i_norm * (valid_vecs / valid_norms.unsqueeze(1))
+        agg_vec = aligned.mean(dim=0)
 
+        num_accepted = int(accept.sum())
         if return_stats:
-            return agg_model, {
-                'num_neighbors': len(neighbor_models),
-                'num_filtered': len(neighbor_models) - num_accepted,
-                'avg_trust': num_accepted / len(neighbor_models),
-            }
-        return agg_model
+            return agg_vec, {'num_neighbors': N,
+                             'num_filtered': N - num_accepted,
+                             'avg_trust': num_accepted / N}
+        return agg_vec
 
 
 def run_ablation_study(config_path=None):
@@ -321,31 +320,38 @@ def run_ablation_study(config_path=None):
 
     device = torch.device(config['experiment']['device'])
     sama_cfg = config['sama']
+    _template_model = SimpleCNN().to(device)
 
     # Define ablation variants
     variants = {
         'Full SAMA': SAMAAggregator(
             alpha=sama_cfg['alpha'],
             trust_layers=sama_cfg.get('trust_layers', None),
+            model_template=_template_model,
         ),
         'No trust_layers': SAMAAggregator(
             alpha=sama_cfg['alpha'],
             trust_layers=None,
+            model_template=_template_model,
         ),
         'No alignment': NoAlignAggregator(
             alpha=sama_cfg['alpha'],
             trust_layers=sama_cfg.get('trust_layers', None),
+            model_template=_template_model,
         ),
         'No direction': NoDirectionAggregator(
             alpha=sama_cfg['alpha'],
+            model_template=_template_model,
         ),
         'No self-anchor': SAMAAggregator(
             alpha=0.0,
             trust_layers=sama_cfg.get('trust_layers', None),
+            model_template=_template_model,
         ),
         'Hard threshold': HardThresholdAggregator(
             alpha=sama_cfg['alpha'],
             trust_layers=sama_cfg.get('trust_layers', None),
+            model_template=_template_model,
         ),
     }
 

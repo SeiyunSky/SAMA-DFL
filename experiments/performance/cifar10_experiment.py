@@ -94,6 +94,7 @@ class CIFAR10Trainer:
                 alpha=self.config['sama']['alpha'],
                 use_temperature=self.config['sama'].get('use_temperature', False),
                 trust_layers=self.config['sama'].get('trust_layers', None),
+                model_template=models[0],
             )
         elif method == 'scclip':
             aggregator = SCCLIPAggregator(
