@@ -17,7 +17,6 @@ from aggregators import SAMAAggregator, BALANCEAggregator
 from models import SimpleCNN
 from utils import load_mnist, generate_ring_topology
 from attacks import GaussianAttack, LabelFlippingAttack, OmniscientAttack
-from collections import OrderedDict
 
 # Set matplotlib to avoid Chinese font issues
 plt.rcParams['font.family'] = 'DejaVu Sans'
@@ -148,6 +147,8 @@ def run_kappa_measurement(num_clients=None, byzantine_ratio=None, num_rounds=Non
     # Two independent model sets — each trained with its own aggregator
     models_sama = [SimpleCNN().to(device) for _ in range(num_clients)]
     models_balance = [SimpleCNN().to(device) for _ in range(num_clients)]
+    optimizers_sama = [torch.optim.SGD(m.parameters(), lr=_tv_cfg['lr']) for m in models_sama]
+    optimizers_balance = [torch.optim.SGD(m.parameters(), lr=_tv_cfg['lr']) for m in models_balance]
 
     # Sync initial weights so comparison is fair
     init_state = models_sama[0].state_dict()
@@ -160,7 +161,7 @@ def run_kappa_measurement(num_clients=None, byzantine_ratio=None, num_rounds=Non
 
     for t in range(num_rounds):
         # === SAMA track ===
-        local_models_sama = []
+        local_vecs_sama = []
         for i in range(num_clients):
             model = models_sama[i]
             model.train()
@@ -168,7 +169,7 @@ def run_kappa_measurement(num_clients=None, byzantine_ratio=None, num_rounds=Non
                 try:
                     data, target = next(iter(train_loaders[i]))
                     data, target = data.to(device), target.to(device)
-                    optimizer = torch.optim.SGD(model.parameters(), lr=_tv_cfg['lr'])
+                    optimizer = optimizers_sama[i]
                     optimizer.zero_grad()
                     output = model(data)
                     loss = torch.nn.functional.cross_entropy(output, target)
@@ -181,7 +182,7 @@ def run_kappa_measurement(num_clients=None, byzantine_ratio=None, num_rounds=Non
                     data, target = next(iter(train_loaders[i]))
                     data, target = data.to(device), target.to(device)
                     target = (9 - target)
-                    optimizer = torch.optim.SGD(model.parameters(), lr=_tv_cfg['lr'])
+                    optimizer = optimizers_sama[i]
                     optimizer.zero_grad()
                     output = model(data)
                     loss = torch.nn.functional.cross_entropy(output, target)
@@ -189,10 +190,10 @@ def run_kappa_measurement(num_clients=None, byzantine_ratio=None, num_rounds=Non
                     optimizer.step()
                 except:
                     pass
-            local_models_sama.append(model.state_dict())
+            local_vecs_sama.append(sama_agg.model_to_vector(models_sama[i]))
 
         # === BALANCE track ===
-        local_models_balance = []
+        local_vecs_balance = []
         for i in range(num_clients):
             model = models_balance[i]
             model.train()
@@ -200,7 +201,7 @@ def run_kappa_measurement(num_clients=None, byzantine_ratio=None, num_rounds=Non
                 try:
                     data, target = next(iter(train_loaders[i]))
                     data, target = data.to(device), target.to(device)
-                    optimizer = torch.optim.SGD(model.parameters(), lr=_tv_cfg['lr'])
+                    optimizer = optimizers_balance[i]
                     optimizer.zero_grad()
                     output = model(data)
                     loss = torch.nn.functional.cross_entropy(output, target)
@@ -213,7 +214,7 @@ def run_kappa_measurement(num_clients=None, byzantine_ratio=None, num_rounds=Non
                     data, target = next(iter(train_loaders[i]))
                     data, target = data.to(device), target.to(device)
                     target = (9 - target)
-                    optimizer = torch.optim.SGD(model.parameters(), lr=_tv_cfg['lr'])
+                    optimizer = optimizers_balance[i]
                     optimizer.zero_grad()
                     output = model(data)
                     loss = torch.nn.functional.cross_entropy(output, target)
@@ -221,33 +222,20 @@ def run_kappa_measurement(num_clients=None, byzantine_ratio=None, num_rounds=Non
                     optimizer.step()
                 except:
                     pass
-            local_models_balance.append(model.state_dict())
+            local_vecs_balance.append(balance_agg.model_to_vector(models_balance[i]))
 
         # Apply post-training attacks to both tracks
         if attack_type == 'gaussian':
             for byz_id in byzantine_nodes:
-                malicious = OrderedDict()
-                for key, param in local_models_sama[byz_id].items():
-                    if isinstance(param, torch.Tensor):
-                        malicious[key] = param + torch.randn_like(param) * _tv_cfg['gaussian_attack_std']
-                    else:
-                        malicious[key] = param
-                local_models_sama[byz_id] = malicious
-
-                malicious_b = OrderedDict()
-                for key, param in local_models_balance[byz_id].items():
-                    if isinstance(param, torch.Tensor):
-                        malicious_b[key] = param + torch.randn_like(param) * _tv_cfg['gaussian_attack_std']
-                    else:
-                        malicious_b[key] = param
-                local_models_balance[byz_id] = malicious_b
+                local_vecs_sama[byz_id] = local_vecs_sama[byz_id] + torch.randn_like(local_vecs_sama[byz_id]) * _tv_cfg['gaussian_attack_std']
+                local_vecs_balance[byz_id] = local_vecs_balance[byz_id] + torch.randn_like(local_vecs_balance[byz_id]) * _tv_cfg['gaussian_attack_std']
         elif attack_type == 'omniscient':
             omniscient = OmniscientAttack(amplification=_config['attack'].get('amplification', 2.0))
-            honest_s = [local_models_sama[i] for i in honest_nodes]
-            honest_b = [local_models_balance[i] for i in honest_nodes]
+            honest_s = [local_vecs_sama[i] for i in honest_nodes]
+            honest_b = [local_vecs_balance[i] for i in honest_nodes]
             for byz_id in byzantine_nodes:
-                local_models_sama[byz_id] = omniscient.attack(honest_s)
-                local_models_balance[byz_id] = omniscient.attack(honest_b)
+                local_vecs_sama[byz_id] = omniscient.attack(honest_s)
+                local_vecs_balance[byz_id] = omniscient.attack(honest_b)
 
         # Aggregate and estimate kappa for both tracks
         kappas_sama_round = []
@@ -260,34 +248,28 @@ def run_kappa_measurement(num_clients=None, byzantine_ratio=None, num_rounds=Non
             honest_mask = [j in honest_nodes for j in neighbor_ids]
 
             # SAMA track
-            own_s = local_models_sama[i]
-            nbr_s = [local_models_sama[j] for j in neighbor_ids]
-            agg_s = sama_agg.aggregate(own_s, nbr_s, t=t, T=num_rounds)
-            final_s = sama_agg.final_update(own_s, agg_s)
-            updated_sama[i] = final_s
+            own_vec_s = local_vecs_sama[i]
+            nbr_vecs_s = [local_vecs_sama[j] for j in neighbor_ids]
+            agg_vec_s = sama_agg.aggregate(own_vec_s, nbr_vecs_s, t=t, T=num_rounds)
+            final_vec_s = sama_agg.final_update(own_vec_s, agg_vec_s)
+            updated_sama[i] = final_vec_s
 
             # BALANCE track
-            own_b = local_models_balance[i]
-            nbr_b = [local_models_balance[j] for j in neighbor_ids]
-            agg_b, balance_stats = balance_agg.aggregate(own_b, nbr_b, t=t, T=num_rounds, return_stats=True)
-            final_b = balance_agg.final_update(own_b, agg_b)
-            updated_balance[i] = final_b
+            own_vec_b = local_vecs_balance[i]
+            nbr_vecs_b = [local_vecs_balance[j] for j in neighbor_ids]
+            agg_vec_b, balance_stats = balance_agg.aggregate(own_vec_b, nbr_vecs_b, t=t, T=num_rounds, return_stats=True)
+            final_vec_b = balance_agg.final_update(own_vec_b, agg_vec_b)
+            updated_balance[i] = final_vec_b
 
             # Estimate kappa (skip initial rounds)
             if t >= _tv_cfg['skip_initial_rounds']:
                 # SAMA kappa
-                own_vec_s = sama_agg.model_to_vector(own_s)
-                nbr_vecs_s = [sama_agg.model_to_vector(m) for m in nbr_s]
-                agg_vec_s = sama_agg.model_to_vector(agg_s)
                 ks = KappaEstimator.estimate_kappa(own_vec_s, nbr_vecs_s, agg_vec_s, honest_mask, 'sama')
                 if ks is not None and ks < _tv_cfg['kappa_filter_max']:
                     kappas_sama_round.append(ks)
 
                 # BALANCE kappa
                 if balance_stats.get('num_accepted', 0) > 0:
-                    own_vec_b = balance_agg.model_to_vector(own_b)
-                    nbr_vecs_b = [balance_agg.model_to_vector(m) for m in nbr_b]
-                    agg_vec_b = balance_agg.model_to_vector(agg_b)
                     kb = KappaEstimator.estimate_kappa(own_vec_b, nbr_vecs_b, agg_vec_b, honest_mask, 'balance')
                     if kb is not None and kb < _tv_cfg['kappa_filter_max']:
                         kappas_balance_round.append(kb)
@@ -295,9 +277,9 @@ def run_kappa_measurement(num_clients=None, byzantine_ratio=None, num_rounds=Non
         # Update models with their own aggregation results
         for i in honest_nodes:
             if i in updated_sama:
-                models_sama[i].load_state_dict(updated_sama[i])
+                sama_agg.load_from_vector(models_sama[i], updated_sama[i])
             if i in updated_balance:
-                models_balance[i].load_state_dict(updated_balance[i])
+                balance_agg.load_from_vector(models_balance[i], updated_balance[i])
 
         if kappas_sama_round:
             kappa_sama_history.append(np.median(kappas_sama_round))
@@ -396,6 +378,7 @@ def run_kappa_measurement(num_clients=None, byzantine_ratio=None, num_rounds=Non
     save_dir.mkdir(exist_ok=True)
     fname = f'kappa_measurement_{attack_type}.png'
     plt.savefig(save_dir / fname, dpi=300, bbox_inches='tight')
+    plt.close()
     print(f"\nPlot saved to: {save_dir / fname}")
 
     return {

@@ -1,98 +1,59 @@
 """
 BALANCE Aggregator Implementation
-基于时变阈值筛选的拜占庭鲁棒聚合器
 """
 import torch
 import numpy as np
-from collections import OrderedDict
 from .base import BaseAggregator
 
 
 class BALANCEAggregator(BaseAggregator):
-    """
-    BALANCE聚合器（对比基线）
-
-    核心机制:
-    1. 相似性检查: ||w_i - w_j|| ≤ γ·exp(-κ·t/T)·||w_i||
-    2. 硬阈值筛选: 通过则保留，否则丢弃
-    3. 自锚定融合: w_i^{t+1} = α·w_i' + (1-α)·(1/|S|)·Σw_j
-    """
 
     def __init__(self, alpha=0.5, gamma=0.5, kappa=0.1):
-        """
-        参数:
-            alpha: 自锚定权重
-            gamma: 基础阈值系数
-            kappa: 衰减速率
-        """
         super().__init__(name="BALANCE", alpha=alpha)
         self.gamma = gamma
         self.kappa = kappa
 
     def compute_threshold(self, t, T, own_norm):
-        """
-        计算时变阈值
-        T(t) = γ · exp(-κ·t/T) · ||w_i||
-        """
         decay = np.exp(-self.kappa * t / T)
         return self.gamma * decay * own_norm
 
-    def aggregate(self, own_model, neighbor_models, t=0, T=100, return_stats=False):
-        """
-        BALANCE聚合逻辑
+    def aggregate(self, own_vec, neighbor_vecs, t=0, T=100, return_stats=False, **kwargs):
+        if isinstance(neighbor_vecs, list):
+            if not neighbor_vecs:
+                if return_stats:
+                    return own_vec, {'num_neighbors': 0, 'num_accepted': 0}
+                return own_vec
+            neighbor_mat = torch.stack(neighbor_vecs)
+        else:
+            neighbor_mat = neighbor_vecs
 
-        参数同SAMA
-        """
-        if not neighbor_models:
-            if return_stats:
-                return own_model, {'num_neighbors': 0, 'num_accepted': 0}
-            return own_model
-
-        # 转换为向量
-        w_i_vec = self.model_to_vector(own_model)
-        w_i_norm = torch.norm(w_i_vec).item()
-
-        # 计算阈值
+        N = neighbor_mat.shape[0]
+        w_i_norm = torch.norm(own_vec).item()
         threshold = self.compute_threshold(t, T, w_i_norm)
 
-        # 硬筛选
-        accepted = []
-        distances = []
+        dists = torch.norm(neighbor_mat - own_vec.unsqueeze(0), dim=1)
+        accept_mask = dists <= threshold
 
-        for neighbor in neighbor_models:
-            w_j_vec = self.model_to_vector(neighbor)
-            dist = torch.norm(w_i_vec - w_j_vec).item()
-            distances.append(dist)
-
-            if dist <= threshold:
-                accepted.append(neighbor)
-
-        if not accepted:
+        if not accept_mask.any():
             if return_stats:
-                stats = {
-                    'num_neighbors': len(neighbor_models),
-                    'num_accepted': 0,
+                return own_vec, {
+                    'num_neighbors': N, 'num_accepted': 0,
                     'threshold': threshold,
-                    'avg_distance': np.mean(distances),
+                    'avg_distance': dists.mean().item(),
                     'avg_trust': 0.0,
                 }
-                return own_model, stats
-            return own_model
+            return own_vec
 
-        # 平均聚合通过的邻居
-        agg_vec = torch.stack([self.model_to_vector(m) for m in accepted]).mean(dim=0)
-        agg_model = self.vector_to_model(agg_vec, own_model)
+        agg_vec = neighbor_mat[accept_mask].mean(dim=0)
 
         if return_stats:
-            accept_rate = len(accepted) / len(neighbor_models)
-            stats = {
-                'num_neighbors': len(neighbor_models),
-                'num_accepted': len(accepted),
+            num_accepted = int(accept_mask.sum().item())
+            accept_rate = num_accepted / N
+            return agg_vec, {
+                'num_neighbors': N, 'num_accepted': num_accepted,
                 'threshold': threshold,
-                'avg_distance': np.mean(distances),
+                'avg_distance': dists.mean().item(),
                 'acceptance_rate': accept_rate,
                 'avg_trust': accept_rate,
             }
-            return agg_model, stats
-
-        return agg_model
+        return agg_vec

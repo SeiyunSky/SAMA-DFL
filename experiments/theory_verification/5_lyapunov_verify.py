@@ -17,7 +17,6 @@ plt.rcParams['font.family'] = 'DejaVu Sans'
 from aggregators import SAMAAggregator
 from models import SimpleCNN
 from utils import load_mnist, generate_ring_topology
-from collections import OrderedDict
 
 # Load config
 _config_path = Path(__file__).parent.parent.parent / 'configs' / 'mnist.yaml'
@@ -27,7 +26,7 @@ _tv_cfg = _config['theory_verification']
 _sama_cfg = _config['sama']
 
 
-def compute_lyapunov_function(models, honest_nodes, optimal_loss=0.0):
+def compute_lyapunov_function(honest_vecs_list, honest_nodes, optimal_loss=0.0):
     """
     计算Lyapunov函数 V_t = ε_t + ρ·D_t
 
@@ -36,22 +35,14 @@ def compute_lyapunov_function(models, honest_nodes, optimal_loss=0.0):
         D_t = (1/|H|)Σ||w_i - w̄_H||² (共识误差)
 
     参数:
-        models: List[state_dict] - 所有节点的模型
-        honest_nodes: List[int] - 诚实节点索引
+        honest_vecs_list: List[Tensor] - 诚实节点的模型向量
+        honest_nodes: List[int] - 诚实节点索引（用于长度信息，不直接索引）
         optimal_loss: float - 最优损失F*（近似）
 
     返回:
-        tuple - (V_t, epsilon_t, D_t)
+        tuple - (D_t, honest_mean)
     """
-    aggregator = SAMAAggregator()
-
-    # 提取诚实节点向量
-    honest_vecs = []
-    for i in honest_nodes:
-        vec = aggregator.model_to_vector(models[i])
-        honest_vecs.append(vec)
-
-    honest_vecs = torch.stack(honest_vecs)
+    honest_vecs = torch.stack(honest_vecs_list)
     honest_mean = honest_vecs.mean(dim=0)
 
     # 共识误差 D_t
@@ -94,6 +85,7 @@ def run_lyapunov_verification(num_clients=None, byzantine_ratio=None, num_rounds
     byzantine_nodes = list(range(num_clients - num_byzantine, num_clients))
 
     models = [SimpleCNN().to(device) for _ in range(num_clients)]
+    optimizers = [torch.optim.SGD(m.parameters(), lr=_tv_cfg['lr']) for m in models]
     aggregator = SAMAAggregator(alpha=_sama_cfg['alpha'], use_temperature=True)
     global_model = SimpleCNN().to(device)
 
@@ -103,7 +95,7 @@ def run_lyapunov_verification(num_clients=None, byzantine_ratio=None, num_rounds
     delta_V_history = []
 
     for t in range(num_rounds):
-        local_models = []
+        local_vecs = []
         for i in range(num_clients):
             model = models[i]
             model.train()
@@ -113,7 +105,7 @@ def run_lyapunov_verification(num_clients=None, byzantine_ratio=None, num_rounds
                     data, target = next(iter(train_loaders[i]))
                     data, target = data.to(device), target.to(device)
 
-                    optimizer = torch.optim.SGD(model.parameters(), lr=_tv_cfg['lr'])
+                    optimizer = optimizers[i]
                     optimizer.zero_grad()
                     output = model(data)
                     loss = torch.nn.functional.cross_entropy(output, target)
@@ -122,39 +114,33 @@ def run_lyapunov_verification(num_clients=None, byzantine_ratio=None, num_rounds
                 except:
                     pass
 
-            local_models.append(model.state_dict())
+            local_vecs.append(aggregator.model_to_vector(models[i]))
 
         for byz_id in byzantine_nodes:
-            malicious = OrderedDict()
-            for key, param in local_models[byz_id].items():
-                if isinstance(param, torch.Tensor):
-                    malicious[key] = param + torch.randn_like(param) * _tv_cfg['gaussian_attack_std']
-                else:
-                    malicious[key] = param
-            local_models[byz_id] = malicious
+            local_vecs[byz_id] = local_vecs[byz_id] + torch.randn_like(local_vecs[byz_id]) * _tv_cfg['gaussian_attack_std']
 
-        updated_models = []
+        updated_vecs = []
         for i in range(num_clients):
-            own_model = local_models[i]
-            neighbor_models = [local_models[j] for j in neighbors[i]]
+            own_vec = local_vecs[i]
+            neighbor_vecs = [local_vecs[j] for j in neighbors[i]]
 
             if i in honest_nodes:
-                aggregated = aggregator.aggregate(own_model, neighbor_models, t=t, T=num_rounds)
-                final = aggregator.final_update(own_model, aggregated)
+                aggregated = aggregator.aggregate(own_vec, neighbor_vecs, t=t, T=num_rounds)
+                final_vec = aggregator.final_update(own_vec, aggregated)
             else:
-                final = own_model
+                final_vec = own_vec
 
-            updated_models.append(final)
+            updated_vecs.append(final_vec)
 
-        models = [SimpleCNN().to(device) for _ in range(num_clients)]
-        for i, state_dict in enumerate(updated_models):
-            models[i].load_state_dict(state_dict)
+        for i, vec in enumerate(updated_vecs):
+            aggregator.load_from_vector(models[i], vec)
 
         # 计算Lyapunov函数
-        D_t, honest_mean = compute_lyapunov_function(updated_models, honest_nodes)
+        honest_vecs_t = [updated_vecs[i] for i in honest_nodes]
+        D_t, honest_mean = compute_lyapunov_function(honest_vecs_t, honest_nodes)
 
         # 评估诚实平均模型的损失
-        global_model.load_state_dict(aggregator.vector_to_model(honest_mean, global_model.state_dict()))
+        aggregator.load_from_vector(global_model, honest_mean)
         global_model.eval()
 
         total_loss = 0
@@ -204,7 +190,7 @@ def run_lyapunov_verification(num_clients=None, byzantine_ratio=None, num_rounds
     print(f"\n✓ Monotonicity verification: {'PASS' if is_mostly_decreasing else 'FAIL'} (>70% decreasing)")
     print(f"✓ Convergence verification: {'PASS' if is_converged else 'FAIL'} (<5% variation)")
 
-    return {
+    result = {
         'V_history': V_history,
         'D_history': D_history,
         'loss_history': loss_history,
@@ -213,14 +199,9 @@ def run_lyapunov_verification(num_clients=None, byzantine_ratio=None, num_rounds
         'steady_state_V': steady_state_V
     }
 
-
-if __name__ == "__main__":
-    result = run_lyapunov_verification()
-
     # 绘图
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-    # Top-left: Lyapunov function time series
     axes[0, 0].plot(result['V_history'], linewidth=2, alpha=0.7)
     axes[0, 0].axhline(result['steady_state_V'], color='r', linestyle='--',
                       label=f"Steady State: {result['steady_state_V']:.2f}")
@@ -232,7 +213,6 @@ if __name__ == "__main__":
     axes[0, 0].legend()
     axes[0, 0].grid(True, alpha=0.3)
 
-    # Top-right: ΔV distribution
     axes[0, 1].hist(result['delta_V_history'], bins=50, edgecolor='black', alpha=0.7)
     axes[0, 1].axvline(0, color='r', linestyle='--', linewidth=2, label='ΔV=0')
     axes[0, 1].set_xlabel('ΔV_t = V_t - V_{t-1}')
@@ -241,7 +221,6 @@ if __name__ == "__main__":
     axes[0, 1].legend()
     axes[0, 1].grid(True, alpha=0.3)
 
-    # Bottom-left: Loss and consensus error decomposition
     ax1 = axes[1, 0]
     ax1.plot(result['loss_history'], color='C0', linewidth=2, label='Test Loss')
     ax1.set_xlabel('Training Round (×10)')
@@ -256,7 +235,6 @@ if __name__ == "__main__":
 
     axes[1, 0].set_title('Loss and Consensus Error Decomposition')
 
-    # Bottom-right: V_t moving average
     window = 20
     V_smooth = np.convolve(result['V_history'], np.ones(window)/window, mode='valid')
     axes[1, 1].plot(result['V_history'], alpha=0.3, color='gray', label='Raw')
@@ -274,3 +252,10 @@ if __name__ == "__main__":
     save_dir.mkdir(exist_ok=True)
     plt.savefig(save_dir / 'lyapunov_verification.png', dpi=300, bbox_inches='tight')
     print(f"\nPlot saved to: {save_dir / 'lyapunov_verification.png'}")
+    plt.close(fig)
+
+    return result
+
+
+if __name__ == "__main__":
+    run_lyapunov_verification()

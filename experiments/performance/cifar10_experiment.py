@@ -11,7 +11,14 @@ from pathlib import Path
 import sys
 import os
 import yaml
-from tqdm import tqdm
+from tqdm import tqdm as _tqdm_base
+import sys as _sys
+def tqdm(*a, **kw):
+    kw.setdefault('file', _sys.stdout)
+    kw.setdefault('ascii', True)
+    kw.setdefault('mininterval', 2.0)
+    kw.setdefault('miniters', 1)
+    return _tqdm_base(*a, **kw)
 
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
@@ -75,6 +82,10 @@ class CIFAR10Trainer:
         from models import SimpleCNN
         models = [SimpleCNN(num_classes=10, in_channels=3).to(self.device)
                  for _ in range(self.num_clients)]
+        optimizers = [torch.optim.SGD(m.parameters(), lr=lr,
+                                      momentum=self.config['optimizer'].get('momentum', 0.0),
+                                      weight_decay=self.config['optimizer'].get('weight_decay', 0.0))
+                      for m in models]
 
         # 聚合器
         if method == 'sama':
@@ -104,15 +115,13 @@ class CIFAR10Trainer:
         pbar = tqdm(range(num_rounds), desc=f"{method.upper()}")
         for t in pbar:
             # 本地训练
-            local_models = []
+            local_vecs = []
             for i in range(self.num_clients):
                 model = models[i]
 
                 if i in self.honest_nodes:
                     model.train()
-                    optimizer = torch.optim.SGD(model.parameters(), lr=lr,
-                                                momentum=self.config['optimizer'].get('momentum', 0.0),
-                                                weight_decay=self.config['optimizer'].get('weight_decay', 0.0))
+                    optimizer = optimizers[i]
                     for epoch in range(local_epochs):
                         for data, target in self.train_loaders[i]:
                             data, target = data.to(self.device), target.to(self.device)
@@ -123,9 +132,7 @@ class CIFAR10Trainer:
                             optimizer.step()
                 elif self.attack and isinstance(self.attack, LabelFlippingAttack):
                     model.train()
-                    optimizer = torch.optim.SGD(model.parameters(), lr=lr,
-                                                momentum=self.config['optimizer'].get('momentum', 0.0),
-                                                weight_decay=self.config['optimizer'].get('weight_decay', 0.0))
+                    optimizer = optimizers[i]
                     for epoch in range(local_epochs):
                         for data, target in self.train_loaders[i]:
                             data, target = data.to(self.device), target.to(self.device)
@@ -136,54 +143,49 @@ class CIFAR10Trainer:
                             loss.backward()
                             optimizer.step()
 
-                local_models.append(model.state_dict())
+                local_vecs.append(aggregator.model_to_vector(models[i]))
 
             # 拜占庭攻击（非Label Flipping类型）
             if self.attack and not isinstance(self.attack, LabelFlippingAttack):
-                honest_models = [local_models[i] for i in self.honest_nodes]
+                honest_vecs_atk = [local_vecs[i] for i in self.honest_nodes]
                 if isinstance(self.attack, (OmniscientAttack, KrumAttack, TrimAttack)):
                     for byz_id in self.byzantine_nodes:
-                        local_models[byz_id] = self.attack.attack(honest_models)
+                        local_vecs[byz_id] = self.attack.attack(honest_vecs_atk)
                 else:
                     for byz_id in self.byzantine_nodes:
-                        local_models[byz_id] = self.attack.attack(local_models[byz_id])
+                        local_vecs[byz_id] = self.attack.attack(local_vecs[byz_id])
 
             # 聚合
-            updated_models = []
+            updated_vecs = []
             for i in range(self.num_clients):
-                own_model = local_models[i]
-                neighbor_models = [local_models[j] for j in self.neighbors[i]]
+                own_vec = local_vecs[i]
+                neighbor_vecs = [local_vecs[j] for j in self.neighbors[i]]
 
                 if i in self.honest_nodes:
                     aggregated, agg_stats = aggregator.aggregate(
-                        own_model, neighbor_models, t=t, T=num_rounds, return_stats=True
+                        own_vec, neighbor_vecs, t=t, T=num_rounds, return_stats=True
                     )
                     avg_trust = agg_stats.get('avg_trust', None)
-                    final = aggregator.final_update(own_model, aggregated, avg_trust=avg_trust)
+                    final_vec = aggregator.final_update(own_vec, aggregated, avg_trust=avg_trust)
                 else:
-                    final = own_model
+                    final_vec = own_vec
 
-                updated_models.append(final)
+                updated_vecs.append(final_vec)
 
-            models = [SimpleCNN(num_classes=10, in_channels=3).to(self.device)
-                     for _ in range(self.num_clients)]
-            for i, state_dict in enumerate(updated_models):
-                models[i].load_state_dict(state_dict)
+            for i, vec in enumerate(updated_vecs):
+                aggregator.load_from_vector(models[i], vec)
 
             # 评估
             if (t + 1) % self.config['logging']['log_interval'] == 0:
                 # 共识误差
-                honest_vecs = [aggregator.model_to_vector(updated_models[i])
-                              for i in self.honest_nodes]
-                honest_vecs = torch.stack(honest_vecs)
-                honest_mean = honest_vecs.mean(dim=0)
-                D_t = torch.mean(torch.norm(honest_vecs - honest_mean, dim=1).pow(2)).item()
+                honest_vecs = [updated_vecs[i] for i in self.honest_nodes]
+                honest_vecs_t = torch.stack(honest_vecs)
+                honest_mean = honest_vecs_t.mean(dim=0)
+                D_t = torch.mean(torch.norm(honest_vecs_t - honest_mean, dim=1).pow(2)).item()
 
                 # 测试
                 global_model = SimpleCNN(num_classes=10, in_channels=3).to(self.device)
-                global_model.load_state_dict(
-                    aggregator.vector_to_model(honest_mean, global_model.state_dict())
-                )
+                aggregator.load_from_vector(global_model, honest_mean)
                 global_model.eval()
 
                 correct, total, loss_sum = 0, 0, 0
@@ -287,6 +289,7 @@ def run_cifar10_experiment(config_path=None):
     save_dir.mkdir(exist_ok=True)
     fname = f"cifar10_{attack_type}_byz{int(byz_ratio*100)}_alpha{noniid_alpha}.png"
     plt.savefig(save_dir / fname, dpi=300, bbox_inches='tight')
+    plt.close()
     print(f"\nPlot saved to: {save_dir / fname}")
 
     # Print results

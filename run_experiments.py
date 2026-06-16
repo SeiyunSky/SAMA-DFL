@@ -4,7 +4,17 @@ Main experiment runner
 import argparse
 import sys
 import importlib
+import io
+import os
 from pathlib import Path
+
+# 强制 stdout/stderr 为行缓冲，TUI 子进程才能实时看到 print/tqdm 输出
+# 只在支持 reconfigure 时执行（部分环境下 stdout 是裸二进制流）
+try:
+    sys.stdout.reconfigure(line_buffering=True, write_through=True)
+    sys.stderr.reconfigure(line_buffering=True, write_through=True)
+except (AttributeError, io.UnsupportedOperation):
+    pass
 
 sys.path.append(str(Path(__file__).parent))
 

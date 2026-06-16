@@ -1,6 +1,5 @@
 """
-Krum / Multi-Krum Aggregator（去中心化版本）
-Reference: Blanchard et al. (2017) "Machine Learning with Adversaries: Byzantine Tolerant Gradient Descent"
+Krum / Multi-Krum Aggregator
 """
 import torch
 import numpy as np
@@ -8,70 +7,44 @@ from .base import BaseAggregator
 
 
 class KrumAggregator(BaseAggregator):
-    """
-    Krum / Multi-Krum聚合器（去中心化版本，对比基线）
-
-    核心机制:
-    - 对每个候选模型 w_j，计算其到最近 (n-f-2) 个邻居的距离平方和作为 Krum 得分
-    - Krum: 选得分最低的单个模型
-    - Multi-Krum: 选得分最低的 m 个模型取均值
-
-    去中心化适配: n 和 f 基于各节点的邻居子集大小计算
-    """
 
     def __init__(self, alpha=0.5, multi_k=None, byzantine_ratio=0.2):
-        """
-        参数:
-            alpha: 自锚定权重
-            multi_k: Multi-Krum 选取的模型数量（None 表示使用 Krum）
-            byzantine_ratio: 预期拜占庭比例，用于估算 f
-        """
         super().__init__(name="Multi-Krum" if multi_k else "Krum", alpha=alpha)
         self.multi_k = multi_k
         self.byzantine_ratio = byzantine_ratio
 
-    def _krum_scores(self, vecs, f):
-        """
-        计算每个向量的 Krum 得分
-        得分 = 到最近 (n-f-2) 个向量的距离平方和
-        """
-        n = len(vecs)
-        k = max(1, n - f - 2)
-        scores = []
-        for i, vi in enumerate(vecs):
-            dists = sorted(
-                [torch.norm(vi - vecs[j]).item() ** 2 for j in range(n) if j != i]
-            )
-            scores.append(sum(dists[:k]))
-        return scores
+    def aggregate(self, own_vec, neighbor_vecs, t=0, T=100, return_stats=False, **kwargs):
+        if isinstance(neighbor_vecs, list):
+            if not neighbor_vecs:
+                if return_stats:
+                    return own_vec, {'num_neighbors': 0, 'avg_trust': None}
+                return own_vec
+            neighbor_mat = torch.stack(neighbor_vecs)
+        else:
+            neighbor_mat = neighbor_vecs
 
-    def aggregate(self, own_model, neighbor_models, t=0, T=100, return_stats=False):
-        if not neighbor_models:
-            if return_stats:
-                return own_model, {'num_neighbors': 0, 'avg_trust': None}
-            return own_model
-
-        candidates = [own_model] + neighbor_models
-        vecs = [self.model_to_vector(m) for m in candidates]
-        n = len(candidates)
+        vecs = torch.cat([own_vec.unsqueeze(0), neighbor_mat], dim=0)  # [N, D]
+        n = vecs.shape[0]
         f = max(1, int(n * self.byzantine_ratio))
+        k = max(1, n - f - 2)
 
-        scores = self._krum_scores(vecs, f)
+        diff = vecs.unsqueeze(0) - vecs.unsqueeze(1)   # [N, N, D]
+        dist_sq = (diff ** 2).sum(dim=2)               # [N, N]
+        dist_sq.fill_diagonal_(float('inf'))
+        topk_vals, _ = torch.topk(dist_sq, k, dim=1, largest=False)
+        scores = topk_vals.sum(dim=1)                  # [N]
 
         if self.multi_k is not None:
             m = min(self.multi_k, n - f)
-            selected_idx = sorted(range(n), key=lambda i: scores[i])[:m]
-            agg_vec = torch.stack([vecs[i] for i in selected_idx]).mean(dim=0)
+            selected_idx = torch.topk(scores, m, largest=False).indices
+            agg_vec = vecs[selected_idx].mean(dim=0)
         else:
-            best_idx = int(np.argmin(scores))
-            agg_vec = vecs[best_idx]
-
-        agg_model = self.vector_to_model(agg_vec, own_model)
+            agg_vec = vecs[scores.argmin()]
 
         if return_stats:
-            return agg_model, {
-                'num_neighbors': len(neighbor_models),
+            return agg_vec, {
+                'num_neighbors': n - 1,
                 'avg_trust': None,
-                'krum_scores': scores,
+                'krum_scores': scores.cpu().tolist(),
             }
-        return agg_model
+        return agg_vec

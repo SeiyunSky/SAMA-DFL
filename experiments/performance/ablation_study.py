@@ -13,7 +13,14 @@ import os
 import yaml
 import copy
 import multiprocessing
-from tqdm import tqdm
+from tqdm import tqdm as _tqdm_base
+import sys as _sys
+def tqdm(*a, **kw):
+    kw.setdefault('file', _sys.stdout)
+    kw.setdefault('ascii', True)
+    kw.setdefault('mininterval', 2.0)
+    kw.setdefault('miniters', 1)
+    return _tqdm_base(*a, **kw)
 
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
@@ -40,7 +47,7 @@ def train_ablation_run(config, aggregator, device):
         num_clients=num_clients,
         alpha=config['data']['non_iid_alpha'],
         batch_size=config['federated']['batch_size'],
-        num_workers=config['federated'].get('num_workers', multiprocessing.cpu_count())
+        num_workers=config['federated'].get('num_workers', 2)
     )
 
     topology_type = config['topology']['type']
@@ -64,9 +71,10 @@ def train_ablation_run(config, aggregator, device):
         attack = None
 
     models = [SimpleCNN().to(device) for _ in range(num_clients)]
+    optimizers = [torch.optim.SGD(m.parameters(), lr=lr) for m in models]
 
     for t in range(num_rounds):
-        local_models = []
+        local_vecs = []
         for i in range(num_clients):
             model = models[i]
             if i in honest_nodes:
@@ -74,7 +82,7 @@ def train_ablation_run(config, aggregator, device):
                 for epoch in range(local_epochs):
                     for data, target in train_loaders[i]:
                         data, target = data.to(device), target.to(device)
-                        optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+                        optimizer = optimizers[i]
                         optimizer.zero_grad()
                         output = model(data)
                         loss = torch.nn.functional.cross_entropy(output, target)
@@ -86,48 +94,45 @@ def train_ablation_run(config, aggregator, device):
                     for data, target in train_loaders[i]:
                         data, target = data.to(device), target.to(device)
                         target = attack.flip_labels(target)
-                        optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+                        optimizer = optimizers[i]
                         optimizer.zero_grad()
                         output = model(data)
                         loss = torch.nn.functional.cross_entropy(output, target)
                         loss.backward()
                         optimizer.step()
-            local_models.append(model.state_dict())
+            local_vecs.append(aggregator.model_to_vector(models[i]))
 
         if attack and not isinstance(attack, LabelFlippingAttack):
-            honest_models = [local_models[i] for i in honest_nodes]
+            honest_vecs = [local_vecs[i] for i in honest_nodes]
             if isinstance(attack, (OmniscientAttack, KrumAttack, TrimAttack)):
                 for byz_id in byzantine_nodes:
-                    local_models[byz_id] = attack.attack(honest_models)
+                    local_vecs[byz_id] = attack.attack(honest_vecs)
             else:
                 for byz_id in byzantine_nodes:
-                    local_models[byz_id] = attack.attack(local_models[byz_id])
+                    local_vecs[byz_id] = attack.attack(local_vecs[byz_id])
 
-        updated_models = []
+        updated_vecs = []
         for i in range(num_clients):
-            own_model = local_models[i]
-            neighbor_models = [local_models[j] for j in neighbors[i]]
+            own_vec = local_vecs[i]
+            neighbor_vecs = [local_vecs[j] for j in neighbors[i]]
             if i in honest_nodes:
                 aggregated, agg_stats = aggregator.aggregate(
-                    own_model, neighbor_models, t=t, T=num_rounds, return_stats=True
+                    own_vec, neighbor_vecs, t=t, T=num_rounds, return_stats=True
                 )
                 avg_trust = agg_stats.get('avg_trust', None)
-                final = aggregator.final_update(own_model, aggregated, avg_trust=avg_trust)
+                final_vec = aggregator.final_update(own_vec, aggregated, avg_trust=avg_trust)
             else:
-                final = own_model
-            updated_models.append(final)
+                final_vec = own_vec
+            updated_vecs.append(final_vec)
 
-        models = [SimpleCNN().to(device) for _ in range(num_clients)]
-        for i, state_dict in enumerate(updated_models):
-            models[i].load_state_dict(state_dict)
+        for i, vec in enumerate(updated_vecs):
+            aggregator.load_from_vector(models[i], vec)
 
     # Evaluate
-    honest_vecs = [aggregator.model_to_vector(updated_models[i]) for i in honest_nodes]
+    honest_vecs = [updated_vecs[i] for i in honest_nodes]
     honest_mean = torch.stack(honest_vecs).mean(dim=0)
     global_model = SimpleCNN().to(device)
-    global_model.load_state_dict(
-        aggregator.vector_to_model(honest_mean, global_model.state_dict())
-    )
+    aggregator.load_from_vector(global_model, honest_mean)
     global_model.eval()
 
     correct, total = 0, 0
@@ -388,6 +393,7 @@ def run_ablation_study(config_path=None):
     save_dir.mkdir(exist_ok=True)
     fname = f"ablation_{attack_type}_byz{int(byz_ratio * 100)}.png"
     plt.savefig(save_dir / fname, dpi=300, bbox_inches='tight')
+    plt.close()
     print(f"\nPlot saved to: {save_dir / fname}")
 
     # Print table

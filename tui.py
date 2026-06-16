@@ -19,7 +19,7 @@ if hasattr(sys.stdout, 'reconfigure'):
         pass
 from datetime import datetime
 
-from rich.console import Console
+from rich.console import Console, Group
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
@@ -36,30 +36,27 @@ from utils import check_all_datasets, download_dataset
 
 DATA_DIR = str(PROJ_DIR / 'data')
 
-console = Console()
+console = Console(width=80)
 
-# 显存占用阈值：超过此值不再向该卡补任务
-GPU_MEM_THRESHOLD = 0.70
+THEORY_EXPERIMENTS = {'lemma41', 'convergence', 'kappa', 'consensus', 'lyapunov'}
+PERF_MAX_PARALLEL = 1  # 性能实验内部已用 ProcessPoolExecutor，外层必须严格串行
 
 
 # ──────────────────────────────────────────────────────────
 # GPU 信息
 # ──────────────────────────────────────────────────────────
 
-def get_gpu_info(index=0):
+def get_gpu_info():
     try:
         result = subprocess.run(
             ['nvidia-smi',
-             f'--query-gpu=memory.used,memory.total,utilization.gpu,temperature.gpu',
+             '--query-gpu=memory.used,memory.total,utilization.gpu,temperature.gpu',
              '--format=csv,noheader,nounits'],
             capture_output=True, text=True, timeout=3
         )
         if result.returncode != 0:
             return None
-        lines = [l.strip() for l in result.stdout.strip().splitlines() if l.strip()]
-        if index >= len(lines):
-            return None
-        parts = lines[index].split(',')
+        parts = result.stdout.strip().split(',')
         return {
             'mem_used': int(parts[0].strip()),
             'mem_total': int(parts[1].strip()),
@@ -70,36 +67,19 @@ def get_gpu_info(index=0):
         return None
 
 
-def get_gpu_count():
-    try:
-        result = subprocess.run(
-            ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
-            capture_output=True, text=True, timeout=3
-        )
-        if result.returncode != 0:
-            return 1
-        return len([l for l in result.stdout.strip().splitlines() if l.strip()])
-    except Exception:
-        return 1
-
-
-def _gpu_mem_pct(gpu_index):
-    info = get_gpu_info(gpu_index)
+def render_gpu_panel():
+    info = get_gpu_info()
     if info is None:
-        return 0.0
-    return info['mem_used'] / info['mem_total']
+        return Panel("[dim]GPU 信息不可用[/dim]", title="GPU", border_style="dim")
 
-
-def _render_one_gpu(info, label):
-    if info is None:
-        return Text(f"{label}: 不可用", style="dim")
     pct = info['mem_used'] / info['mem_total']
     bar_len = 20
     filled = int(bar_len * pct)
     bar = "#" * filled + "." * (bar_len - filled)
+
     color = "green" if pct < 0.7 else ("yellow" if pct < 0.9 else "red")
     mem_text = Text()
-    mem_text.append(f"{label} MEM  [{bar}] ", style="white")
+    mem_text.append(f"MEM  [{bar}] ", style="white")
     mem_text.append(f"{info['mem_used']}/{info['mem_total']} MB ({pct:.0%})", style=color)
 
     util_pct = info['util'] / 100
@@ -107,28 +87,13 @@ def _render_one_gpu(info, label):
     u_bar = "#" * u_filled + "." * (bar_len - u_filled)
     u_color = "green" if util_pct < 0.5 else ("yellow" if util_pct < 0.85 else "red")
     util_text = Text()
-    util_text.append(f"{label} UTIL [{u_bar}] ", style="white")
+    util_text.append(f"UTIL [{u_bar}] ", style="white")
     util_text.append(f"{info['util']}%", style=u_color)
     util_text.append(f"   Temp {info['temp']}C",
                      style="green" if info['temp'] < 75 else "yellow")
-    return Text.assemble(mem_text, "\n", util_text)
 
-
-def render_gpu_panel():
-    gpu_count = get_gpu_count()
-    lines = []
-    for i in range(gpu_count):
-        info = get_gpu_info(i)
-        lines.append(_render_one_gpu(info, f"GPU{i}"))
-
-    content = Text()
-    for i, line in enumerate(lines):
-        content.append_text(line)
-        if i < len(lines) - 1:
-            content.append("\n")
-
-    panel_size = 3 + (gpu_count - 1) * 2
-    return Panel(content, title="[bold cyan]GPU[/bold cyan]", border_style="cyan"), panel_size
+    content = Text.assemble(mem_text, "\n", util_text)
+    return Panel(content, title="[bold cyan]GPU[/bold cyan]", border_style="cyan")
 
 
 # ──────────────────────────────────────────────────────────
@@ -166,7 +131,8 @@ def render_results_table():
 # 数据集检测与下载
 # ──────────────────────────────────────────────────────────
 
-def render_dataset_panel(status: dict):    table = Table(box=box.SIMPLE, show_header=False, expand=True)
+def render_dataset_panel(status: dict):
+    table = Table(box=box.SIMPLE, show_header=False, expand=True)
     table.add_column("数据集", style="bold", width=12)
     table.add_column("状态")
     for name, ok in status.items():
@@ -229,31 +195,26 @@ EXPERIMENTS = {
         'label': '理论验证实验',
         'items': [
             ('A1', 'lemma41',    '引理4.1  幅度对齐公式验证'),
-            ('A2', 'convergence','B1  收敛速率测量'),
-            ('A3', 'kappa',      'B2  κ 值对比 SAMA vs BALANCE'),
-            ('A4', 'consensus',  'B3  共识直径 vs 理论上界'),
-            ('A5', 'lyapunov',   'B4  Lyapunov 函数单调性'),
+            ('A2', 'convergence','收敛速率测量'),
+            ('A3', 'kappa',      'κ 值对比 SAMA vs BALANCE'),
+            ('A4', 'consensus',  '共识直径 vs 理论上界'),
+            ('A5', 'lyapunov',   'Lyapunov 函数单调性'),
         ]
     },
     'B': {
-        'label': '性能对比实验',
+        'label': '性能实验',
         'items': [
-            ('B1', 'multi_attack_table',  'C1  MNIST 多攻击汇总（8方法×6攻击）'),
-            ('B2', 'cifar10_attack_table','C2  CIFAR-10 多攻击汇总（8方法×6攻击）'),
-            ('B3', 'ablation',            '消融实验（4种变体）'),
-            ('B4', 'client_scale',        '客户端数量扩展性（n=20/30/40）'),
-        ]
-    },
-    'C': {
-        'label': '参数扫描实验',
-        'items': [
-            ('C1', 'byz_sweep',   'C3  拜占庭比例扫描 (0.1~0.4)'),
-            ('C2', 'noniid_sweep','C4  Non-IID 程度扫描 (α=0.1/0.2/0.3)'),
+            ('B1', 'multi_attack_table',  'MNIST 多攻击汇总（8方法×6攻击）'),
+            ('B2', 'cifar10_attack_table','CIFAR-10 多攻击汇总（8方法×6攻击）'),
+            ('B3', 'byz_sweep',           '拜占庭比例扫描 (0.1~0.4)'),
+            ('B4', 'noniid_sweep',        'Non-IID 程度扫描 (α=0.1/0.2/0.3)'),
+            ('B5', 'ablation',            '消融实验（6种变体）'),
+            ('B6', 'client_scale',        '客户端数量扩展性（n=20/30/40）'),
         ]
     },
 }
 
-PERF_GROUPS = {'B', 'C'}
+PERF_GROUPS = {'B'}
 NO_ATTACK_PROMPT = {'multi_attack_table', 'cifar10_attack_table', 'client_scale'}
 
 
@@ -280,22 +241,52 @@ class ExperimentRunner:
         env = os.environ.copy()
         if self.attack:
             env['ATTACK_TYPE'] = self.attack
-        if hasattr(self, 'env_extra') and self.env_extra:
-            env.update(self.env_extra)
-        cmd = [sys.executable, str(PROJ_DIR / 'run_experiments.py'),
+        cmd = [sys.executable, '-u', str(PROJ_DIR / 'run_experiments.py'),
                '--experiment', self.exp_key]
         self.proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, env=env, cwd=str(PROJ_DIR),
+            env=env, cwd=str(PROJ_DIR),
+            bufsize=0,
         )
         threading.Thread(target=self._read_output, daemon=True).start()
 
     def _read_output(self):
-        for line in self.proc.stdout:
-            with self._lock:
-                self.output_lines.append(line.rstrip())
-                if len(self.output_lines) > 200:
-                    self.output_lines = self.output_lines[-200:]
+        # 用底层二进制 read1，读多少返回多少，避免阻塞凑满 buffer
+        import io
+        raw = self.proc.stdout.buffer if isinstance(self.proc.stdout, io.TextIOBase) else self.proc.stdout
+        buf = ""
+        while True:
+            try:
+                chunk_bytes = raw.read1(4096) if hasattr(raw, 'read1') else raw.read(1)
+            except Exception:
+                break
+            if not chunk_bytes:
+                break
+            chunk = chunk_bytes.decode('utf-8', errors='replace') if isinstance(chunk_bytes, bytes) else chunk_bytes
+            buf += chunk
+            while '\n' in buf or '\r' in buf:
+                nl = buf.find('\n')
+                cr = buf.find('\r')
+                if nl == -1:
+                    idx, is_cr = cr, True
+                elif cr == -1:
+                    idx, is_cr = nl, False
+                else:
+                    idx, is_cr = (cr, True) if cr < nl else (nl, False)
+
+                line = buf[:idx].rstrip('\r\n')
+                buf = buf[idx+1:]
+
+                if not line:
+                    continue
+                with self._lock:
+                    if is_cr and self.output_lines:
+                        # \r 覆写最后一行（tqdm 进度条行为）
+                        self.output_lines[-1] = line
+                    else:
+                        self.output_lines.append(line)
+                        if len(self.output_lines) > 200:
+                            self.output_lines = self.output_lines[-200:]
         self.proc.wait()
         self.returncode = self.proc.returncode
         self.running = False
@@ -325,51 +316,49 @@ class ExperimentRunner:
 
 
 # ──────────────────────────────────────────────────────────
-# 并行批量运行
+# 并行批量运行（显存动态调度）
 # ──────────────────────────────────────────────────────────
 
 def run_parallel(jobs: list):
     """
-    双卡动态调度：GPU显存 < 70% 才向该卡补任务。
-    每张卡维护独立的 active 槽，任务按卡轮流分配。
-    jobs: list of ExperimentRunner
+    理论实验全部并行；性能实验最多同时跑 PERF_MAX_PARALLEL 个。
+    理论实验先全部启动，性能实验串行补入。
     """
-    gpu_count = get_gpu_count()
-    pending = list(jobs)
-    # active[gpu_idx] = list of running jobs on that gpu
-    active = [[] for _ in range(gpu_count)]
-    # 给每个 job 预先分配目标卡（轮询）
-    for i, job in enumerate(jobs):
-        job.target_gpu = i % gpu_count
+    theory_jobs = [j for j in jobs if j.exp_key in THEORY_EXPERIMENTS]
+    perf_jobs = [j for j in jobs if j.exp_key not in THEORY_EXPERIMENTS]
+
+    pending_perf = list(perf_jobs)
+    active_perf = []
     interrupted = False
 
+    # 理论实验全部立即启动
+    for j in theory_jobs:
+        j.start()
+
     try:
-        with Live(console=console, refresh_per_second=2, screen=False) as live:
-            while pending or any(active):
-                # 按卡补任务
-                for gpu_idx in range(gpu_count):
-                    mem_pct = _gpu_mem_pct(gpu_idx)
-                    candidates = [j for j in pending if j.target_gpu == gpu_idx]
-                    if candidates and mem_pct < GPU_MEM_THRESHOLD:
-                        job = candidates[0]
-                        pending.remove(job)
-                        job.env_extra = {'CUDA_VISIBLE_DEVICES': str(gpu_idx)}
-                        job.start()
-                        active[gpu_idx].append(job)
+        with Live(console=console, refresh_per_second=2, screen=True) as live:
+            while True:
+                # 移除已完成的性能实验
+                active_perf = [j for j in active_perf if not j.done]
 
-                # 移除已完成
-                for gpu_idx in range(gpu_count):
-                    active[gpu_idx] = [j for j in active[gpu_idx] if not j.done]
+                # 补性能实验：未超上限就补
+                while pending_perf and len(active_perf) < PERF_MAX_PARALLEL:
+                    j = pending_perf.pop(0)
+                    j.start()
+                    active_perf.append(j)
 
-                all_active = [j for slot in active for j in slot]
-                live.update(_render_parallel_status(jobs, all_active, pending, active, gpu_count))
+                all_active = [j for j in theory_jobs if j.running] + active_perf
+                live.update(_render_parallel_status(jobs, all_active, pending_perf))
                 time.sleep(0.5)
+
+                # 全部完成则退出
+                if all(j.done for j in jobs):
+                    break
 
     except KeyboardInterrupt:
         interrupted = True
-        for slot in active:
-            for j in slot:
-                j.stop()
+        for j in theory_jobs + active_perf:
+            j.stop()
         console.print("\n[yellow]已中断，正在终止所有子进程...[/yellow]")
 
     if not interrupted:
@@ -379,31 +368,64 @@ def run_parallel(jobs: list):
             console.print(f"  {mark} {job.label}  耗时 {job.elapsed()}")
 
 
-def _render_parallel_status(all_jobs, all_active, pending, active_by_gpu, gpu_count):
-    gpu_panel, gpu_size = render_gpu_panel()
+def _render_parallel_status(all_jobs, active, pending):
+    gpu = render_gpu_panel()
 
-    table = Table(box=box.SIMPLE, show_header=True, header_style="bold", expand=True)
-    table.add_column("实验", style="white")
-    table.add_column("卡", width=5)
-    table.add_column("状态", width=20)
-    table.add_column("最新输出", style="dim")
+    # 分组：完成、运行中、等待
+    done_jobs    = [j for j in all_jobs if j.done]
+    running_jobs = [j for j in all_jobs if j.running]
+    waiting_jobs = [j for j in all_jobs if not j.done and not j.running]
 
-    for job in all_jobs:
-        last = job.get_last_lines(1)
-        last_line = last[-1] if last else ""
-        if len(last_line) > 55:
-            last_line = last_line[:52] + "..."
-        gpu_label = f"[cyan]GPU{job.target_gpu}[/cyan]" if hasattr(job, 'target_gpu') else ""
-        table.add_row(job.label, gpu_label, job.status_str(), last_line)
+    renderables = []
 
-    active_counts = "/".join(str(len(slot)) for slot in active_by_gpu)
-    slots_text = f"运行: {active_counts}  排队: {len(pending)}"
-    jobs_panel = Panel(table, title=f"[bold cyan]实验进度  {slots_text}[/bold cyan]",
-                       border_style="cyan")
+    # ── 运行中：每个实验展开显示最近 4 行输出 ──────────────────
+    if running_jobs:
+        for job in running_jobs:
+            lines = job.get_last_lines(4)
+            log_text = Text()
+            for line in lines:
+                if 'ERROR' in line or 'Error' in line:
+                    log_text.append(f"  {line}\n", style="red")
+                elif '%' in line or 'accuracy' in line.lower() or 'acc=' in line.lower() or 'done' in line:
+                    log_text.append(f"  {line}\n", style="green")
+                elif 'round' in line.lower() or 'Round' in line:
+                    log_text.append(f"  {line}\n", style="cyan")
+                else:
+                    log_text.append(f"  {line}\n", style="dim white")
+            renderables.append(Panel(
+                log_text,
+                title=f"[bold cyan]{job.label}  {job.elapsed()}[/bold cyan]",
+                border_style="cyan",
+                padding=(0, 1),
+            ))
+
+    # ── 完成 / 等待：紧凑表格 ──────────────────────────────────
+    if done_jobs or waiting_jobs:
+        table = Table(box=box.SIMPLE, show_header=False, expand=True, padding=(0, 1))
+        table.add_column("实验", style="white")
+        table.add_column("状态", width=18)
+        table.add_column("最新输出", style="dim", max_width=55)
+
+        for job in done_jobs:
+            last = job.get_last_lines(1)
+            last_line = last[-1][:52] + "..." if last and len(last[-1]) > 52 else (last[-1] if last else "")
+            table.add_row(job.label, job.status_str(), last_line)
+
+        for job in waiting_jobs:
+            table.add_row(job.label, "[dim]等待[/dim]", "")
+
+        renderables.append(Panel(table, border_style="dim", padding=(0, 1)))
+
+    slots_text = f"运行: {len(running_jobs)}  完成: {len(done_jobs)}  排队: {len(waiting_jobs)}"
+    jobs_panel = Panel(
+        Group(*renderables) if renderables else Text(""),
+        title=f"[bold cyan]实验进度  {slots_text}[/bold cyan]",
+        border_style="cyan",
+    )
 
     layout = Layout()
     layout.split_column(
-        Layout(gpu_panel, size=gpu_size),
+        Layout(gpu, size=4),
         Layout(jobs_panel),
     )
     return layout
@@ -458,9 +480,8 @@ def run_single(exp_key, label, attack=None):
                         log_text.append(line + "\n", style="dim white")
 
                 layout = Layout()
-                gpu_panel, gpu_size = render_gpu_panel()
                 layout.split_column(
-                    Layout(gpu_panel, size=gpu_size),
+                    Layout(render_gpu_panel(), size=4),
                     Layout(Panel(log_text,
                                  title=f"[bold cyan]{label}  {job.elapsed()}[/bold cyan]",
                                  border_style="cyan")),
@@ -525,8 +546,7 @@ def resolve_experiment(choice):
 
 def main():
     console.clear()
-    gpu_panel, _ = render_gpu_panel()
-    console.print(gpu_panel)
+    console.print(render_gpu_panel())
     check_and_prompt_datasets()
     console.print(render_results_table())
 
@@ -543,12 +563,10 @@ def main():
             break
 
         if choice == 'all':
-            # 收集所有实验，并行跑
             jobs = []
             for group_key, group in EXPERIMENTS.items():
                 for idx_key, exp_key, label in group['items']:
-                    attack = None  # 各实验用配置文件默认攻击
-                    jobs.append(ExperimentRunner(exp_key, label, attack))
+                    jobs.append(ExperimentRunner(exp_key, label, None))
             run_parallel(jobs)
             console.print()
             console.print(render_results_table())

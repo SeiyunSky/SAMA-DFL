@@ -112,6 +112,7 @@ def verify_lemma_41(num_tests=1000, dim=1000):
     save_dir = Path(__file__).parent.parent.parent / 'results'
     save_dir.mkdir(exist_ok=True)
     plt.savefig(save_dir / 'lemma41_verification.png', dpi=300, bbox_inches='tight')
+    plt.close()
     print(f"\nPlot saved to: {save_dir / 'lemma41_verification.png'}")
 
     return results

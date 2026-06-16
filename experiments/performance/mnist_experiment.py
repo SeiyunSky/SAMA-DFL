@@ -11,7 +11,14 @@ from pathlib import Path
 import sys
 import os
 import yaml
-from tqdm import tqdm
+from tqdm import tqdm as _tqdm_base
+import sys as _sys
+def tqdm(*a, **kw):
+    kw.setdefault('file', _sys.stdout)
+    kw.setdefault('ascii', True)
+    kw.setdefault('mininterval', 2.0)
+    kw.setdefault('miniters', 1)
+    return _tqdm_base(*a, **kw)
 
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
@@ -93,6 +100,7 @@ class FederatedTrainer:
 
         # 初始化模型
         models = [SimpleCNN().to(self.device) for _ in range(self.num_clients)]
+        optimizers = [torch.optim.SGD(m.parameters(), lr=lr) for m in models]
 
         # 初始化聚合器
         if method == 'sama':
@@ -156,7 +164,7 @@ class FederatedTrainer:
         pbar = tqdm(range(num_rounds), desc=f"{method.upper()} training")
         for t in pbar:
             # 本地训练
-            local_models = []
+            local_vecs = []
             for i in range(self.num_clients):
                 model = models[i]
 
@@ -167,7 +175,7 @@ class FederatedTrainer:
                         for data, target in self.train_loaders[i]:
                             data, target = data.to(self.device), target.to(self.device)
 
-                            optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+                            optimizer = optimizers[i]
                             optimizer.zero_grad()
                             output = model(data)
                             loss = torch.nn.functional.cross_entropy(output, target)
@@ -181,54 +189,50 @@ class FederatedTrainer:
                             data, target = data.to(self.device), target.to(self.device)
                             target = self.attack.flip_labels(target)
 
-                            optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+                            optimizer = optimizers[i]
                             optimizer.zero_grad()
                             output = model(data)
                             loss = torch.nn.functional.cross_entropy(output, target)
                             loss.backward()
                             optimizer.step()
 
-                local_models.append(model.state_dict())
+                local_vecs.append(aggregator.model_to_vector(models[i]))
 
             # 拜占庭攻击（非Label Flipping类型在训练后修改模型参数）
             if self.attack and not isinstance(self.attack, LabelFlippingAttack):
-                honest_models = [local_models[i] for i in self.honest_nodes]
+                honest_vecs_atk = [local_vecs[i] for i in self.honest_nodes]
                 if isinstance(self.attack, (OmniscientAttack, KrumAttack, TrimAttack)):
                     for byz_id in self.byzantine_nodes:
-                        local_models[byz_id] = self.attack.attack(honest_models)
+                        local_vecs[byz_id] = self.attack.attack(honest_vecs_atk)
                 else:
                     for byz_id in self.byzantine_nodes:
-                        local_models[byz_id] = self.attack.attack(local_models[byz_id])
+                        local_vecs[byz_id] = self.attack.attack(local_vecs[byz_id])
 
             # 去中心化聚合
-            updated_models = []
+            updated_vecs = []
             for i in range(self.num_clients):
-                own_model = local_models[i]
-                neighbor_models = [local_models[j] for j in self.neighbors[i]]
+                own_vec = local_vecs[i]
+                neighbor_vecs = [local_vecs[j] for j in self.neighbors[i]]
 
                 if i in self.honest_nodes:
                     aggregated, agg_stats = aggregator.aggregate(
-                        own_model, neighbor_models, t=t, T=num_rounds, return_stats=True
+                        own_vec, neighbor_vecs, t=t, T=num_rounds, return_stats=True
                     )
                     avg_trust = agg_stats.get('avg_trust', None)
-                    final = aggregator.final_update(own_model, aggregated, avg_trust=avg_trust)
+                    final_vec = aggregator.final_update(own_vec, aggregated, avg_trust=avg_trust)
                 else:
-                    final = own_model
+                    final_vec = own_vec
 
-                updated_models.append(final)
+                updated_vecs.append(final_vec)
 
             # 更新模型
-            models = [SimpleCNN().to(self.device) for _ in range(self.num_clients)]
-            for i, state_dict in enumerate(updated_models):
-                models[i].load_state_dict(state_dict)
+            for i, vec in enumerate(updated_vecs):
+                aggregator.load_from_vector(models[i], vec)
 
             # 评估（每log_interval轮）
             if (t + 1) % self.config['logging']['log_interval'] == 0:
                 # 计算共识误差
-                honest_vecs = []
-                for i in self.honest_nodes:
-                    vec = aggregator.model_to_vector(updated_models[i])
-                    honest_vecs.append(vec)
+                honest_vecs = [updated_vecs[i] for i in self.honest_nodes]
 
                 honest_vecs = torch.stack(honest_vecs)
                 honest_mean = honest_vecs.mean(dim=0)
@@ -236,9 +240,7 @@ class FederatedTrainer:
 
                 # 测试
                 global_model = SimpleCNN().to(self.device)
-                global_model.load_state_dict(
-                    aggregator.vector_to_model(honest_mean, global_model.state_dict())
-                )
+                aggregator.load_from_vector(global_model, honest_mean)
                 global_model.eval()
 
                 correct = 0
@@ -369,6 +371,7 @@ def run_mnist_experiment(config_path=None):
     save_dir.mkdir(exist_ok=True)
     fname = f"mnist_{attack_type}_byz{int(byz_ratio*100)}_alpha{noniid_alpha}.png"
     plt.savefig(save_dir / fname, dpi=300, bbox_inches='tight')
+    plt.close()
     print(f"\nPlot saved to: {save_dir / fname}")
 
     # Print final results

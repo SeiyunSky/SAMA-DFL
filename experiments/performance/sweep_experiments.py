@@ -81,6 +81,11 @@ def train_single_run(config, method, device, neighbors=None, progress_queue=None
     Run a single training experiment, return final accuracy.
     Simplified version of FederatedTrainer for sweep use.
     """
+    # 支持字符串（spawn子进程跨进程传递），也支持 torch.device 对象
+    if isinstance(device, str):
+        device = torch.device(device)
+    # spawn子进程里禁用DataLoader多进程，防止进程数爆炸
+    config['federated']['num_workers'] = 0
     num_clients = config['federated']['num_clients']
     byz_ratio = config['federated']['byzantine_ratio']
     num_rounds = config['federated']['num_rounds']
@@ -93,7 +98,7 @@ def train_single_run(config, method, device, neighbors=None, progress_queue=None
         num_clients=num_clients,
         alpha=config['data']['non_iid_alpha'],
         batch_size=config['federated']['batch_size'],
-        num_workers=config['federated'].get('num_workers', multiprocessing.cpu_count())
+        num_workers=config['federated'].get('num_workers', 2)
     )
 
     # 使用外部传入的拓扑；否则生成
@@ -128,20 +133,21 @@ def train_single_run(config, method, device, neighbors=None, progress_queue=None
 
     # Models and aggregator
     models = [SimpleCNN().to(device) for _ in range(num_clients)]
+    optimizers = [torch.optim.SGD(m.parameters(), lr=lr) for m in models]
     aggregator = create_aggregator(method, config)
 
     # Training
     for t in range(num_rounds):
-        local_models = []
+        local_vecs = []
         for i in range(num_clients):
             model = models[i]
+            optimizer = optimizers[i]
 
             if i in honest_nodes:
                 model.train()
                 for epoch in range(local_epochs):
                     for data, target in train_loaders[i]:
                         data, target = data.to(device), target.to(device)
-                        optimizer = torch.optim.SGD(model.parameters(), lr=lr)
                         optimizer.zero_grad()
                         output = model(data)
                         loss = torch.nn.functional.cross_entropy(output, target)
@@ -153,57 +159,53 @@ def train_single_run(config, method, device, neighbors=None, progress_queue=None
                     for data, target in train_loaders[i]:
                         data, target = data.to(device), target.to(device)
                         target = attack.flip_labels(target)
-                        optimizer = torch.optim.SGD(model.parameters(), lr=lr)
                         optimizer.zero_grad()
                         output = model(data)
                         loss = torch.nn.functional.cross_entropy(output, target)
                         loss.backward()
                         optimizer.step()
 
-            local_models.append(model.state_dict())
+            local_vecs.append(aggregator.model_to_vector(models[i]))
 
         # Post-training attacks
         if attack and not isinstance(attack, LabelFlippingAttack):
-            honest_models = [local_models[i] for i in honest_nodes]
+            honest_vecs = [local_vecs[i] for i in honest_nodes]
             if isinstance(attack, (OmniscientAttack, KrumAttack, TrimAttack)):
                 for byz_id in byzantine_nodes:
-                    local_models[byz_id] = attack.attack(honest_models)
+                    local_vecs[byz_id] = attack.attack(honest_vecs)
             else:
                 for byz_id in byzantine_nodes:
-                    local_models[byz_id] = attack.attack(local_models[byz_id])
+                    local_vecs[byz_id] = attack.attack(local_vecs[byz_id])
 
         # Aggregation
-        updated_models = []
+        updated_vecs = []
         for i in range(num_clients):
-            own_model = local_models[i]
-            neighbor_models = [local_models[j] for j in neighbors[i]]
+            own_vec = local_vecs[i]
+            neighbor_vecs = [local_vecs[j] for j in neighbors[i]]
 
             if i in honest_nodes:
                 aggregated, agg_stats = aggregator.aggregate(
-                    own_model, neighbor_models, t=t, T=num_rounds, return_stats=True
+                    own_vec, neighbor_vecs, t=t, T=num_rounds, return_stats=True
                 )
                 avg_trust = agg_stats.get('avg_trust', None)
-                final = aggregator.final_update(own_model, aggregated, avg_trust=avg_trust)
+                final_vec = aggregator.final_update(own_vec, aggregated, avg_trust=avg_trust)
             else:
-                final = own_model
-            updated_models.append(final)
+                final_vec = own_vec
+            updated_vecs.append(final_vec)
 
-        models = [SimpleCNN().to(device) for _ in range(num_clients)]
-        for i, state_dict in enumerate(updated_models):
-            models[i].load_state_dict(state_dict)
+        for i, vec in enumerate(updated_vecs):
+            aggregator.load_from_vector(models[i], vec)
 
         # 每轮结束向队列报告进度
         if progress_queue is not None and task_label is not None:
             progress_queue.put(f"[{task_label}] round {t+1}/{num_rounds}")
 
     # Final evaluation on honest mean
-    honest_vecs = [aggregator.model_to_vector(updated_models[i]) for i in honest_nodes]
+    honest_vecs = [updated_vecs[i] for i in honest_nodes]
     honest_mean = torch.stack(honest_vecs).mean(dim=0)
 
     global_model = SimpleCNN().to(device)
-    global_model.load_state_dict(
-        aggregator.vector_to_model(honest_mean, global_model.state_dict())
-    )
+    aggregator.load_from_vector(global_model, honest_mean)
     global_model.eval()
 
     correct, total = 0, 0
@@ -216,6 +218,9 @@ def train_single_run(config, method, device, neighbors=None, progress_queue=None
 
     acc = 100.0 * correct / total
 
+    # 释放显存碎片
+    torch.cuda.empty_cache()
+
     # 完成时通知队列
     if progress_queue is not None and task_label is not None:
         progress_queue.put(f"[{task_label}] done accuracy={acc:.2f}%")
@@ -225,8 +230,6 @@ def train_single_run(config, method, device, neighbors=None, progress_queue=None
 
 def _progress_printer(queue, total_tasks, stop_event):
     """主进程监听线程：从队列读进度消息并打印到 stdout。"""
-    # task_label -> 最新 round 消息
-    latest = {}
     done_count = 0
     while not stop_event.is_set() or not queue.empty():
         try:
@@ -259,7 +262,9 @@ def _run_parallel_with_progress(submit_fn, tasks, max_workers):
     printer.start()
 
     future_to_task = {}
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+    mp_context = multiprocessing.get_context('spawn')
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers,
+                                                mp_context=mp_context) as executor:
         for task in tasks:
             future = submit_fn(executor, task, progress_queue)
             future_to_task[future] = task
@@ -291,8 +296,9 @@ def run_byzantine_sweep(config_path=None):
         base_config = yaml.safe_load(f)
 
     device = torch.device(base_config['experiment']['device'])
+    device_str = base_config['experiment']['device']
     methods = ['sama', 'balance', 'scclip', 'fedavg', 'krum', 'multi_krum', 'trimmed_mean', 'coord_median']
-    byz_ratios = [0.1, 0.2, 0.3, 0.4]
+    byz_ratios = [0.1, 0.2, 0.3]
     results = {m: [] for m in methods}
 
     seed = base_config.get('experiment', {}).get('seed', 42)
@@ -315,12 +321,16 @@ def run_byzantine_sweep(config_path=None):
             config = copy.deepcopy(base_config)
             config['federated']['byzantine_ratio'] = byz_ratio
             config['federated']['num_rounds'] = 150
-            config['federated']['num_workers'] = multiprocessing.cpu_count()
+            config['federated']['num_workers'] = 2
             label = f"byz{int(byz_ratio*100)}%/{method.upper()}"
             tasks.append((byz_ratio, method, config, label))
 
     max_workers = min(len(tasks), 4)
-            train_single_run, config, method, device,
+
+    def submit_fn(executor, task, queue):
+        byz_ratio, method, config, label = task
+        return executor.submit(
+            train_single_run, config, method, device_str,
             task_neighbors[byz_ratio], queue, label
         )
 
@@ -373,6 +383,7 @@ def run_byzantine_sweep(config_path=None):
     save_dir.mkdir(exist_ok=True)
     fname = f"byzantine_sweep_{attack_type}_alpha{noniid_alpha}.png"
     plt.savefig(save_dir / fname, dpi=300, bbox_inches='tight')
+    plt.close()
     print(f"\nPlot saved to: {save_dir / fname}")
 
     # Print table
@@ -408,6 +419,7 @@ def run_noniid_sweep(config_path=None):
         base_config = yaml.safe_load(f)
 
     device = torch.device(base_config['experiment']['device'])
+    device_str = base_config['experiment']['device']
     methods = ['sama', 'balance', 'scclip', 'fedavg', 'krum', 'multi_krum', 'trimmed_mean', 'coord_median']
     alpha_values = [0.1, 0.2, 0.3]
     results = {m: [] for m in methods}
@@ -432,13 +444,16 @@ def run_noniid_sweep(config_path=None):
             config = copy.deepcopy(base_config)
             config['data']['non_iid_alpha'] = alpha_val
             config['federated']['num_rounds'] = 150
-            config['federated']['num_workers'] = multiprocessing.cpu_count()
+            config['federated']['num_workers'] = 2
             label = f"α={alpha_val}/{method.upper()}"
             tasks.append((alpha_val, method, config, label))
 
     max_workers = min(len(tasks), 4)
+
+    def submit_fn(executor, task, queue):
+        alpha_val, method, config, label = task
         return executor.submit(
-            train_single_run, config, method, device,
+            train_single_run, config, method, device_str,
             task_neighbors[alpha_val], queue, label
         )
 
@@ -490,6 +505,7 @@ def run_noniid_sweep(config_path=None):
     save_dir.mkdir(exist_ok=True)
     fname = f"noniid_sweep_{attack_type}_byz{int(byz_ratio*100)}.png"
     plt.savefig(save_dir / fname, dpi=300, bbox_inches='tight')
+    plt.close()
     print(f"\nPlot saved to: {save_dir / fname}")
 
     # Print table

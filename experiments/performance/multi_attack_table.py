@@ -17,8 +17,16 @@ import os
 import yaml
 import copy
 import multiprocessing
+import threading
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from tqdm import tqdm
+from tqdm import tqdm as _tqdm_base
+import sys as _sys
+def tqdm(*a, **kw):
+    kw.setdefault('file', _sys.stdout)
+    kw.setdefault('ascii', True)
+    kw.setdefault('mininterval', 2.0)
+    kw.setdefault('miniters', 1)
+    return _tqdm_base(*a, **kw)
 from collections import OrderedDict
 
 sys.path.append(str(Path(__file__).parent.parent.parent))
@@ -117,7 +125,8 @@ def _create_aggregator(method, config):
         raise ValueError(f"Unknown method: {method}")
 
 
-def _train_one(config, method, attack_key, device, dataset='mnist', neighbors=None):
+def _train_one(config, method, attack_key, device, dataset='mnist', neighbors=None,
+               progress_queue=None, task_label=None):
     """单次训练，返回 (最终accuracy, accuracy历史列表)"""
     num_clients = config['federated']['num_clients']
     byz_ratio = config['federated']['byzantine_ratio']
@@ -128,7 +137,7 @@ def _train_one(config, method, attack_key, device, dataset='mnist', neighbors=No
     weight_decay = config['optimizer'].get('weight_decay', 0.0)
     log_interval = config['logging']['log_interval']
 
-    num_workers = config['federated'].get('num_workers', multiprocessing.cpu_count())
+    num_workers = config['federated'].get('num_workers', 2)
 
     if dataset == 'cifar10':
         train_loaders, test_loader = load_cifar10(
@@ -161,20 +170,20 @@ def _train_one(config, method, attack_key, device, dataset='mnist', neighbors=No
     aggregator = _create_aggregator(method, config)
 
     models = [SimpleCNN(**model_kwargs).to(device) for _ in range(num_clients)]
+    optimizers = [torch.optim.SGD(m.parameters(), lr=lr, momentum=momentum,
+                                  weight_decay=weight_decay) for m in models]
     acc_history = []
 
     for t in range(num_rounds):
-        local_models = []
+        local_vecs = []
         for i in range(num_clients):
             model = models[i]
+            optimizer = optimizers[i]
             if i in honest_nodes:
                 model.train()
                 for _ in range(local_epochs):
                     for data, target in train_loaders[i]:
                         data, target = data.to(device), target.to(device)
-                        optimizer = torch.optim.SGD(model.parameters(), lr=lr,
-                                                    momentum=momentum,
-                                                    weight_decay=weight_decay)
                         optimizer.zero_grad()
                         output = model(data)
                         loss = torch.nn.functional.cross_entropy(output, target)
@@ -186,51 +195,46 @@ def _train_one(config, method, attack_key, device, dataset='mnist', neighbors=No
                     for data, target in train_loaders[i]:
                         data, target = data.to(device), target.to(device)
                         target = attack.flip_labels(target)
-                        optimizer = torch.optim.SGD(model.parameters(), lr=lr,
-                                                    momentum=momentum,
-                                                    weight_decay=weight_decay)
                         optimizer.zero_grad()
                         output = model(data)
                         loss = torch.nn.functional.cross_entropy(output, target)
                         loss.backward()
                         optimizer.step()
-            local_models.append(model.state_dict())
+            local_vecs.append(aggregator.model_to_vector(models[i]))
 
         if not isinstance(attack, (NoAttack, LabelFlippingAttack)):
-            honest_models = [local_models[i] for i in honest_nodes]
+            honest_vecs = [local_vecs[i] for i in honest_nodes]
             if isinstance(attack, (OmniscientAttack, KrumAttack, TrimAttack)):
                 for byz_id in byzantine_nodes:
-                    local_models[byz_id] = attack.attack(honest_models)
+                    local_vecs[byz_id] = attack.attack(honest_vecs)
             else:
                 for byz_id in byzantine_nodes:
-                    local_models[byz_id] = attack.attack(local_models[byz_id])
+                    local_vecs[byz_id] = attack.attack(local_vecs[byz_id])
 
-        updated_models = []
+        updated_vecs = []
         for i in range(num_clients):
-            own_model = local_models[i]
-            neighbor_models = [local_models[j] for j in neighbors[i]]
+            own_vec = local_vecs[i]
+            neighbor_vecs = [local_vecs[j] for j in neighbors[i]]
             if i in honest_nodes:
                 aggregated, agg_stats = aggregator.aggregate(
-                    own_model, neighbor_models, t=t, T=num_rounds, return_stats=True
+                    own_vec, neighbor_vecs, t=t, T=num_rounds, return_stats=True
                 )
                 avg_trust = agg_stats.get('avg_trust', None)
-                final = aggregator.final_update(own_model, aggregated, avg_trust=avg_trust)
+                final_vec = aggregator.final_update(own_vec, aggregated, avg_trust=avg_trust)
             else:
-                final = own_model
-            updated_models.append(final)
+                final_vec = own_vec
+            updated_vecs.append(final_vec)
 
-        models = [SimpleCNN(**model_kwargs).to(device) for _ in range(num_clients)]
-        for i, state_dict in enumerate(updated_models):
-            models[i].load_state_dict(state_dict)
+        for i, vec in enumerate(updated_vecs):
+            aggregator.load_from_vector(models[i], vec)
 
-        # 周期评估
+        if progress_queue is not None and task_label is not None:
+            progress_queue.put(f"[{task_label}] round {t+1}/{num_rounds}")
         if (t + 1) % log_interval == 0:
-            honest_vecs = [aggregator.model_to_vector(updated_models[i]) for i in honest_nodes]
+            honest_vecs = [updated_vecs[i] for i in honest_nodes]
             honest_mean = torch.stack(honest_vecs).mean(dim=0)
             global_model = SimpleCNN(**model_kwargs).to(device)
-            global_model.load_state_dict(
-                aggregator.vector_to_model(honest_mean, global_model.state_dict())
-            )
+            aggregator.load_from_vector(global_model, honest_mean)
             global_model.eval()
             correct, total = 0, 0
             with torch.no_grad():
@@ -242,12 +246,13 @@ def _train_one(config, method, attack_key, device, dataset='mnist', neighbors=No
             acc_history.append(100.0 * correct / total)
 
     final_acc = acc_history[-1] if acc_history else 0.0
+    torch.cuda.empty_cache()
     return final_acc, acc_history
 
 
 def _worker(args):
     """顶层 worker，可被 ProcessPoolExecutor pickle。"""
-    m_idx, a_idx, config, method, attack_key, device_str, dataset, neighbors = args
+    m_idx, a_idx, config, method, attack_key, device_str, dataset, neighbors, progress_queue = args
     # 子进程里固定 per-task seed，保证每个 (method, attack) 可复现
     seed = config.get('experiment', {}).get('seed', 42)
     torch.manual_seed(seed + m_idx * 100 + a_idx)
@@ -255,8 +260,12 @@ def _worker(args):
     # 子进程里 DataLoader 不开额外 workers，防止进程数爆炸
     config['federated']['num_workers'] = 0
     device = torch.device(device_str)
+    task_label = f"{method.upper()}/{attack_key}"
     acc, history = _train_one(config, method, attack_key, device,
-                              dataset=dataset, neighbors=neighbors)
+                              dataset=dataset, neighbors=neighbors,
+                              progress_queue=progress_queue, task_label=task_label)
+    if progress_queue is not None:
+        progress_queue.put(f"[{task_label}] done accuracy={acc:.2f}%")
     return m_idx, a_idx, acc, history
 
 
@@ -283,19 +292,32 @@ def _run_table(base_config, dataset_name, save_dir):
     results = np.zeros((len(METHOD_KEYS), len(ATTACK_KEYS)))
     histories = [[None] * len(ATTACK_KEYS) for _ in range(len(METHOD_KEYS))]
 
-    # 并发数：每个 CUDA context 约 400MB，11GB 显存安全上限约 8 个
-    # 可通过环境变量 TABLE_WORKERS 覆盖（如 TABLE_WORKERS=4）
-    max_workers = int(os.getenv('TABLE_WORKERS', min(multiprocessing.cpu_count(), 8)))
+    max_workers = int(os.getenv('TABLE_WORKERS', 4))
+
+    mgr = multiprocessing.Manager()
+    progress_queue = mgr.Queue()
 
     tasks = []
     for a_idx, attack_key in enumerate(ATTACK_KEYS):
         for m_idx, method in enumerate(METHOD_KEYS):
             config = copy.deepcopy(base_config)
             tasks.append((m_idx, a_idx, config, method, attack_key,
-                          device_str, dataset_name, shared_neighbors))
+                          device_str, dataset_name, shared_neighbors, progress_queue))
 
     total = len(tasks)
     pbar = tqdm(total=total, desc=f"Running {dataset_name.upper()} table")
+
+    # 监听线程：把孙进程的进度消息打到 stdout
+    stop_event = threading.Event()
+    def _printer():
+        while not stop_event.is_set() or not progress_queue.empty():
+            try:
+                msg = progress_queue.get(timeout=0.2)
+                print(msg, flush=True)
+            except Exception:
+                pass
+    printer = threading.Thread(target=_printer, daemon=True)
+    printer.start()
 
     with ProcessPoolExecutor(max_workers=max_workers,
                              mp_context=multiprocessing.get_context('spawn')) as executor:
@@ -306,9 +328,13 @@ def _run_table(base_config, dataset_name, save_dir):
             histories[m_idx][a_idx] = history
             method = METHOD_KEYS[m_idx]
             attack = ATTACK_KEYS[a_idx]
+            done = int(pbar.n) + 1
+            print(f"[{done}/{total}] {method.upper()} vs {attack} -> {acc:.2f}%", flush=True)
             pbar.set_postfix({'method': method, 'attack': attack, 'acc': f'{acc:.1f}%'})
             pbar.update(1)
 
+    stop_event.set()
+    printer.join(timeout=2)
     pbar.close()
 
     tag = f"{dataset_name}_byz{int(byz_ratio*100)}_alpha{noniid_alpha}"
@@ -449,7 +475,7 @@ def run_multi_attack_table(config_path=None):
         base_config = yaml.safe_load(f)
 
     base_config['federated']['num_rounds'] = 150
-    base_config['federated']['num_workers'] = multiprocessing.cpu_count()
+    base_config['federated']['num_workers'] = 2
 
     save_dir = Path(__file__).parent.parent.parent / 'results'
     save_dir.mkdir(exist_ok=True)
@@ -470,7 +496,7 @@ def run_cifar10_attack_table(config_path=None):
         base_config = yaml.safe_load(f)
 
     base_config['federated']['num_rounds'] = 200
-    base_config['federated']['num_workers'] = multiprocessing.cpu_count()
+    base_config['federated']['num_workers'] = 2
 
     save_dir = Path(__file__).parent.parent.parent / 'results'
     save_dir.mkdir(exist_ok=True)

@@ -17,7 +17,6 @@ plt.rcParams['font.family'] = 'DejaVu Sans'
 from aggregators import SAMAAggregator, BALANCEAggregator
 from models import SimpleCNN
 from utils import load_mnist, generate_ring_topology, compute_spectral_gap
-from collections import OrderedDict
 
 # Load config
 _config_path = Path(__file__).parent.parent.parent / 'configs' / 'mnist.yaml'
@@ -71,6 +70,7 @@ def measure_consensus_diameter(method='sama', num_clients=None, byzantine_ratio=
     print(f"Honest subgraph spectral gap γ = {gamma:.4f}")
 
     models = [SimpleCNN().to(device) for _ in range(num_clients)]
+    optimizers = [torch.optim.SGD(m.parameters(), lr=_tv_cfg['lr']) for m in models]
 
     if method == 'sama':
         aggregator = SAMAAggregator(alpha=_sama_cfg['alpha'], use_temperature=True)
@@ -84,7 +84,7 @@ def measure_consensus_diameter(method='sama', num_clients=None, byzantine_ratio=
     diameter_history = []  # max_{i,j∈H} ||w_i - w_j||
 
     for t in range(num_rounds):
-        local_models = []
+        local_vecs = []
         for i in range(num_clients):
             model = models[i]
             model.train()
@@ -94,7 +94,7 @@ def measure_consensus_diameter(method='sama', num_clients=None, byzantine_ratio=
                     data, target = next(iter(train_loaders[i]))
                     data, target = data.to(device), target.to(device)
 
-                    optimizer = torch.optim.SGD(model.parameters(), lr=_tv_cfg['lr'])
+                    optimizer = optimizers[i]
                     optimizer.zero_grad()
                     output = model(data)
                     loss = torch.nn.functional.cross_entropy(output, target)
@@ -103,35 +103,28 @@ def measure_consensus_diameter(method='sama', num_clients=None, byzantine_ratio=
                 except:
                     pass
 
-            local_models.append(model.state_dict())
+            local_vecs.append(aggregator.model_to_vector(models[i]))
 
         for byz_id in byzantine_nodes:
-            malicious = OrderedDict()
-            for key, param in local_models[byz_id].items():
-                if isinstance(param, torch.Tensor):
-                    malicious[key] = param + torch.randn_like(param) * _tv_cfg['gaussian_attack_std']
-                else:
-                    malicious[key] = param
-            local_models[byz_id] = malicious
+            local_vecs[byz_id] = local_vecs[byz_id] + torch.randn_like(local_vecs[byz_id]) * _tv_cfg['gaussian_attack_std']
 
-        updated_models = []
+        updated_vecs = []
         for i in range(num_clients):
-            own_model = local_models[i]
-            neighbor_models = [local_models[j] for j in neighbors[i]]
+            own_vec = local_vecs[i]
+            neighbor_vecs = [local_vecs[j] for j in neighbors[i]]
 
             if i in honest_nodes:
-                aggregated = aggregator.aggregate(own_model, neighbor_models, t=t, T=num_rounds)
-                final = aggregator.final_update(own_model, aggregated)
+                aggregated = aggregator.aggregate(own_vec, neighbor_vecs, t=t, T=num_rounds)
+                final_vec = aggregator.final_update(own_vec, aggregated)
             else:
-                final = own_model
+                final_vec = own_vec
 
-            updated_models.append(final)
+            updated_vecs.append(final_vec)
 
-        models = [SimpleCNN().to(device) for _ in range(num_clients)]
-        for i, state_dict in enumerate(updated_models):
-            models[i].load_state_dict(state_dict)
+        for i, vec in enumerate(updated_vecs):
+            aggregator.load_from_vector(models[i], vec)
 
-        honest_vecs = [aggregator.model_to_vector(updated_models[i]) for i in honest_nodes]
+        honest_vecs = [updated_vecs[i] for i in honest_nodes]
 
         max_dist = 0
         for i, vec_i in enumerate(honest_vecs):
@@ -164,7 +157,7 @@ def measure_consensus_diameter(method='sama', num_clients=None, byzantine_ratio=
     print(f"Margin ratio: {(theoretical_bound - steady_state_diameter)/theoretical_bound*100:.1f}%")
     print(f"\nTheorem 5.2 Verification: {'✓ Diameter < Theoretical Bound' if steady_state_diameter < theoretical_bound else '✗ Exceeds Bound'}")
 
-    return {
+    result = {
         'diameter_history': diameter_history,
         'steady_state': steady_state_diameter,
         'theoretical_bound': theoretical_bound,
@@ -173,12 +166,13 @@ def measure_consensus_diameter(method='sama', num_clients=None, byzantine_ratio=
         'num_clients': num_clients,
         'num_byzantine': int(num_clients * byzantine_ratio)
     }
+    _plot_and_save(result)
+    return result
 
 
-if __name__ == "__main__":
-    result = measure_consensus_diameter()
-
-    plt.figure(figsize=(12, 5))
+def _plot_and_save(result):
+    """绘图并保存结果。"""
+    fig = plt.figure(figsize=(12, 5))
 
     plt.subplot(1, 2, 1)
     plt.plot(result['diameter_history'], linewidth=2, alpha=0.7, label='Measured')
@@ -212,3 +206,8 @@ if __name__ == "__main__":
     save_dir.mkdir(exist_ok=True)
     plt.savefig(save_dir / 'consensus_diameter.png', dpi=300, bbox_inches='tight')
     print(f"\nPlot saved to: {save_dir / 'consensus_diameter.png'}")
+    plt.close(fig)
+
+
+if __name__ == "__main__":
+    measure_consensus_diameter()
