@@ -352,6 +352,15 @@ def run_client_scale_experiment(config_path=None):
     fname = f"client_scale_{attack_key}_byz{int(byz_ratio*100)}_alpha{noniid_alpha}.png"
     plt.savefig(save_dir / fname, dpi=300, bbox_inches='tight')
     plt.close()
+    import json
+    json_path = save_dir / fname.replace('.png', '.json')
+    with open(json_path, 'w') as f:
+        json.dump({
+            'meta': {'attack_key': attack_key, 'byz_ratio': byz_ratio,
+                     'noniid_alpha': noniid_alpha, 'n_values': n_values},
+            'results': results,
+        }, f, indent=2)
+    print(f"Raw data saved: {json_path.name}")
     print(f"\nPlot saved to: {save_dir / fname}")
 
     # ── 控制台表格 ──────────────────────────────────────────

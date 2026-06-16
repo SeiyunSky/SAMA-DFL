@@ -211,6 +211,15 @@ def run_convergence_comparison():
     save_dir.mkdir(exist_ok=True)
     plt.savefig(save_dir / 'convergence_rate.png', dpi=300, bbox_inches='tight')
     plt.close()
+    import json
+    json_path = save_dir / 'convergence_rate.json'
+    with open(json_path, 'w') as f:
+        json.dump({
+            'consensus_errors': consensus_errors,
+            'lambda_fitted': float(lambda_fit) if lambda_fit is not None else None,
+            'mu_empirical': float(mu_emp) if mu_emp is not None else None,
+        }, f, indent=2)
+    print(f"Raw data saved: {json_path.name}")
     print(f"\nPlot saved to: {save_dir / 'convergence_rate.png'}")
 
     # Print summary

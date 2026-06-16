@@ -113,6 +113,16 @@ def verify_lemma_41(num_tests=1000, dim=1000):
     save_dir.mkdir(exist_ok=True)
     plt.savefig(save_dir / 'lemma41_verification.png', dpi=300, bbox_inches='tight')
     plt.close()
+    import json
+    save_dir = Path(__file__).parent.parent.parent / 'results'
+    save_dir.mkdir(exist_ok=True)
+    json_path = save_dir / 'lemma41_verification.json'
+    with open(json_path, 'w') as f:
+        json.dump({
+            'results': {k: float(v) for k, v in results.items()},
+            'errors': errors.tolist(),
+        }, f, indent=2)
+    print(f"Raw data saved: {json_path.name}")
     print(f"\nPlot saved to: {save_dir / 'lemma41_verification.png'}")
 
     return results

@@ -379,6 +379,18 @@ def run_kappa_measurement(num_clients=None, byzantine_ratio=None, num_rounds=Non
     fname = f'kappa_measurement_{attack_type}.png'
     plt.savefig(save_dir / fname, dpi=300, bbox_inches='tight')
     plt.close()
+    import json
+    json_path = save_dir / fname.replace('.png', '.json')
+    with open(json_path, 'w') as f:
+        json.dump({
+            'kappa_sama_history': [float(v) for v in kappa_sama_history],
+            'kappa_balance_history': [float(v) for v in kappa_balance_history],
+            'kappa_sama_avg': float(kappa_sama_avg),
+            'kappa_sama_std': float(kappa_sama_std),
+            'kappa_balance_avg': float(kappa_balance_avg),
+            'kappa_balance_std': float(kappa_balance_std),
+        }, f, indent=2)
+    print(f"Raw data saved: {json_path.name}")
     print(f"\nPlot saved to: {save_dir / fname}")
 
     return {

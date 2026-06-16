@@ -81,7 +81,7 @@ ATTACK_COLORS = [
 ATTACK_LINESTYLES = ['-', '--', '-.', ':', '-', '--']
 
 
-def _create_aggregator(method, config):
+def _create_aggregator(method, config, model_template=None):
     if method == 'sama':
         return SAMAAggregator(
             alpha=config['sama']['alpha'],
@@ -89,6 +89,7 @@ def _create_aggregator(method, config):
             tau_max=config['sama'].get('tau_max', 1.0),
             tau_min=config['sama'].get('tau_min', 0.01),
             trust_layers=config['sama'].get('trust_layers', None),
+            model_template=model_template,
         )
     elif method == 'balance':
         return BALANCEAggregator(
@@ -126,7 +127,7 @@ def _create_aggregator(method, config):
 
 
 def _train_one(config, method, attack_key, device, dataset='mnist', neighbors=None,
-               progress_queue=None, task_label=None):
+               progress_queue=None, task_label=None, log_file=None):
     """单次训练，返回 (最终accuracy, accuracy历史列表)"""
     num_clients = config['federated']['num_clients']
     byz_ratio = config['federated']['byzantine_ratio']
@@ -166,11 +167,10 @@ def _train_one(config, method, attack_key, device, dataset='mnist', neighbors=No
     honest_nodes = set(range(num_clients - num_byzantine))
     byzantine_nodes = set(range(num_clients - num_byzantine, num_clients))
 
-    attack = _build_attack(attack_key, num_byzantine, config)
-    aggregator = _create_aggregator(method, config)
-
     models = [SimpleCNN(**model_kwargs).to(device) for _ in range(num_clients)]
     eval_model = SimpleCNN(**model_kwargs).to(device)
+    attack = _build_attack(attack_key, num_byzantine, config)
+    aggregator = _create_aggregator(method, config, model_template=models[0])
     optimizers = [torch.optim.SGD(m.parameters(), lr=lr, momentum=momentum,
                                   weight_decay=weight_decay) for m in models]
     acc_history = []
@@ -245,6 +245,9 @@ def _train_one(config, method, attack_key, device, dataset='mnist', neighbors=No
                     correct += pred.eq(target).sum().item()
                     total += target.size(0)
             acc_history.append(100.0 * correct / total)
+            if log_file is not None:
+                with open(log_file, 'a') as f:
+                    f.write(f"round={t+1}/{num_rounds} acc={acc_history[-1]:.2f}%\n")
 
     final_acc = acc_history[-1] if acc_history else 0.0
     torch.cuda.empty_cache()
@@ -262,9 +265,15 @@ def _worker(args):
     config['federated']['num_workers'] = 0
     device = torch.device(device_str)
     task_label = f"{method.upper()}/{attack_key}"
+
+    log_dir = Path(__file__).parent.parent.parent / 'results' / 'logs'
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / f"{dataset}_{method}_{attack_key}.log"
+
     acc, history = _train_one(config, method, attack_key, device,
                               dataset=dataset, neighbors=neighbors,
-                              progress_queue=progress_queue, task_label=task_label)
+                              progress_queue=progress_queue, task_label=task_label,
+                              log_file=log_file)
     if progress_queue is not None:
         progress_queue.put(f"[{task_label}] done accuracy={acc:.2f}%")
     return m_idx, a_idx, acc, history
@@ -433,6 +442,35 @@ def _run_table(base_config, dataset_name, save_dir):
         for a_idx in range(len(ATTACK_KEYS)):
             print(f"  {results[m_idx, a_idx]:>9.2f}%", end="")
         print()
+
+    # ── 原始数据保存（供二次绘图）────────────────────────────
+    data = {
+        'meta': {
+            'dataset': dataset_name,
+            'byzantine_ratio': byz_ratio,
+            'noniid_alpha': noniid_alpha,
+            'num_rounds': num_rounds,
+            'log_interval': log_interval,
+            'round_ticks': round_ticks,
+            'methods': METHOD_KEYS,
+            'attacks': ATTACK_KEYS,
+        },
+        'final_acc': {
+            METHOD_KEYS[m]: {ATTACK_KEYS[a]: float(results[m, a])
+                             for a in range(len(ATTACK_KEYS))}
+            for m in range(len(METHOD_KEYS))
+        },
+        'histories': {
+            METHOD_KEYS[m]: {ATTACK_KEYS[a]: histories[m][a]
+                             for a in range(len(ATTACK_KEYS))}
+            for m in range(len(METHOD_KEYS))
+        },
+    }
+    import json
+    json_path = save_dir / f'data_{tag}.json'
+    with open(json_path, 'w') as f:
+        json.dump(data, f, indent=2)
+    print(f"Raw data saved: {json_path.name}")
 
     # ── LaTeX 表格 ──────────────────────────────────────────
     print(f"\n% LaTeX table ({ds_upper}):")

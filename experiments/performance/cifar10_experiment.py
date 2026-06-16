@@ -294,6 +294,26 @@ def run_cifar10_experiment(config_path=None):
     plt.close()
     print(f"\nPlot saved to: {save_dir / fname}")
 
+    # 原始数据保存
+    import json
+    data = {
+        'meta': {
+            'dataset': 'cifar10',
+            'attack_type': attack_type,
+            'byzantine_ratio': byz_ratio,
+            'noniid_alpha': noniid_alpha,
+            'num_rounds': config['federated']['num_rounds'],
+            'log_interval': config['logging']['log_interval'],
+        },
+        'results': {m: {k: (v.tolist() if hasattr(v, 'tolist') else v)
+                        for k, v in results[m].items()}
+                   for m in results},
+    }
+    json_path = save_dir / f"cifar10_{attack_type}_byz{int(byz_ratio*100)}_alpha{noniid_alpha}.json"
+    with open(json_path, 'w') as f:
+        json.dump(data, f, indent=2)
+    print(f"Raw data saved to: {json_path.name}")
+
     # Print results
     print("\n" + "=" * 80)
     print("CIFAR-10 Final Results")

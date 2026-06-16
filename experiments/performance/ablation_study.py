@@ -395,6 +395,14 @@ def run_ablation_study(config_path=None):
     fname = f"ablation_{attack_type}_byz{int(byz_ratio * 100)}.png"
     plt.savefig(save_dir / fname, dpi=300, bbox_inches='tight')
     plt.close()
+    import json
+    json_path = save_dir / fname.replace('.png', '.json')
+    with open(json_path, 'w') as f:
+        json.dump({
+            'meta': {'attack_type': attack_type, 'byz_ratio': byz_ratio},
+            'results': results,
+        }, f, indent=2)
+    print(f"Raw data saved: {json_path.name}")
     print(f"\nPlot saved to: {save_dir / fname}")
 
     # Print table

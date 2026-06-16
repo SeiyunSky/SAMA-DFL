@@ -164,6 +164,20 @@ def measure_consensus_diameter(method='sama', num_clients=None, byzantine_ratio=
         'num_byzantine': int(num_clients * byzantine_ratio)
     }
     _plot_and_save(result)
+    import json
+    save_dir = Path(__file__).parent.parent.parent / 'results'
+    json_path = save_dir / 'consensus_diameter.json'
+    with open(json_path, 'w') as f:
+        json.dump({
+            'diameter_history': result['diameter_history'],
+            'steady_state': float(result['steady_state']),
+            'theoretical_bound': float(result['theoretical_bound']),
+            'gamma': float(result['gamma']),
+            'kappa': float(result['kappa']),
+            'num_clients': result['num_clients'],
+            'num_byzantine': result['num_byzantine'],
+        }, f, indent=2)
+    print(f"Raw data saved: {json_path.name}")
     return result
 
 

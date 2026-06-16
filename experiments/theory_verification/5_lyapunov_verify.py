@@ -254,6 +254,18 @@ def run_lyapunov_verification(num_clients=None, byzantine_ratio=None, num_rounds
     plt.savefig(save_dir / 'lyapunov_verification.png', dpi=300, bbox_inches='tight')
     print(f"\nPlot saved to: {save_dir / 'lyapunov_verification.png'}")
     plt.close(fig)
+    import json
+    json_path = save_dir / 'lyapunov_verification.json'
+    with open(json_path, 'w') as f:
+        json.dump({
+            'V_history': result['V_history'],
+            'D_history': result['D_history'],
+            'loss_history': result['loss_history'],
+            'delta_V_history': result['delta_V_history'],
+            'decrease_ratio': float(result['decrease_ratio']),
+            'steady_state_V': float(result['steady_state_V']),
+        }, f, indent=2)
+    print(f"Raw data saved: {json_path.name}")
 
     return result
 

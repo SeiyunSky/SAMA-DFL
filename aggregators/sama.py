@@ -9,14 +9,33 @@ from .base import BaseAggregator
 class SAMAAggregator(BaseAggregator):
 
     def __init__(self, alpha=0.5, tau_max=1.0, tau_min=0.01, use_temperature=False,
-                 trust_layers=None, eps=1e-8):
+                 trust_layers=None, model_template=None, eps=1e-8):
         super().__init__(name="SAMA-DFL", alpha=alpha)
         self.tau_max = tau_max
         self.tau_min = tau_min
         self.use_temperature = use_temperature
         self.trust_layers = trust_layers
         self.eps = eps
-        self._trust_indices = None
+        # Pre-compute trust slice indices from model_template using parameters() order
+        self._trust_slices = self._compute_trust_slices(model_template)
+
+    def _compute_trust_slices(self, model_template):
+        """
+        Compute (start, end) index pairs for trust_layers in the flat parameter vector.
+        Uses model.parameters() order, which matches model_to_vector(nn.Module).
+        Called once at init time; requires a model_template instance.
+        Returns None if trust_layers is None or model_template is not provided.
+        """
+        if self.trust_layers is None or model_template is None:
+            return None
+        slices = []
+        idx = 0
+        for name, param in model_template.named_parameters():
+            n = param.numel()
+            if name in self.trust_layers:
+                slices.append((idx, idx + n))
+            idx += n
+        return slices if slices else None
 
     def compute_temperature(self, t, T):
         if not self.use_temperature:
@@ -24,35 +43,12 @@ class SAMAAggregator(BaseAggregator):
         decay = np.exp(-5.0 * t / T)
         return self.tau_min + (self.tau_max - self.tau_min) * decay
 
-    def _get_trust_indices(self, model):
-        if self._trust_indices is not None:
-            return self._trust_indices
-        if self.trust_layers is None:
-            return None
-        idx = 0
-        slices = []
-        state = model.state_dict()
-        for key in sorted(state.keys()):
-            param = state[key]
-            if not isinstance(param, torch.Tensor):
-                continue
-            n = param.numel()
-            if key in self.trust_layers:
-                slices.append((idx, idx + n))
-            idx += n
-        self._trust_indices = slices
-        return slices
-
-    def _extract_trust_vec(self, full_vec, model=None):
-        if self.trust_layers is None or model is None:
+    def _extract_trust_vec(self, full_vec):
+        if self._trust_slices is None:
             return full_vec
-        slices = self._get_trust_indices(model)
-        if not slices:
-            return full_vec
-        return torch.cat([full_vec[s:e] for s, e in slices])
+        return torch.cat([full_vec[s:e] for s, e in self._trust_slices])
 
-    def aggregate(self, own_vec, neighbor_vecs, t=0, T=100, return_stats=False,
-                  model=None, **kwargs):
+    def aggregate(self, own_vec, neighbor_vecs, t=0, T=100, return_stats=False, **kwargs):
         if isinstance(neighbor_vecs, list):
             if not neighbor_vecs:
                 if return_stats:
@@ -69,11 +65,10 @@ class SAMAAggregator(BaseAggregator):
                 return own_vec, {'error': 'own_model_zero_norm'}
             return own_vec
 
-        w_i_trust = self._extract_trust_vec(own_vec, model)
+        w_i_trust = self._extract_trust_vec(own_vec)
         w_i_trust_norm = torch.norm(w_i_trust)
 
-        neighbor_trust = torch.stack([self._extract_trust_vec(neighbor_mat[i], model)
-                                       for i in range(N)])
+        neighbor_trust = torch.stack([self._extract_trust_vec(neighbor_mat[i]) for i in range(N)])
         neighbor_trust_norms = torch.norm(neighbor_trust, dim=1)
         neighbor_norms = torch.norm(neighbor_mat, dim=1)
 

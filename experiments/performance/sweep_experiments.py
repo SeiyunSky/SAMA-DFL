@@ -385,6 +385,15 @@ def run_byzantine_sweep(config_path=None):
     fname = f"byzantine_sweep_{attack_type}_alpha{noniid_alpha}.png"
     plt.savefig(save_dir / fname, dpi=300, bbox_inches='tight')
     plt.close()
+    import json
+    json_path = save_dir / fname.replace('.png', '.json')
+    with open(json_path, 'w') as f:
+        json.dump({
+            'meta': {'attack_type': attack_type, 'noniid_alpha': noniid_alpha,
+                     'byz_ratios': byz_ratios},
+            'results': results,
+        }, f, indent=2)
+    print(f"Raw data saved: {json_path.name}")
     print(f"\nPlot saved to: {save_dir / fname}")
 
     # Print table
@@ -507,6 +516,15 @@ def run_noniid_sweep(config_path=None):
     fname = f"noniid_sweep_{attack_type}_byz{int(byz_ratio*100)}.png"
     plt.savefig(save_dir / fname, dpi=300, bbox_inches='tight')
     plt.close()
+    import json
+    json_path = save_dir / fname.replace('.png', '.json')
+    with open(json_path, 'w') as f:
+        json.dump({
+            'meta': {'attack_type': attack_type, 'byz_ratio': byz_ratio,
+                     'alpha_values': alpha_values},
+            'results': results,
+        }, f, indent=2)
+    print(f"Raw data saved: {json_path.name}")
     print(f"\nPlot saved to: {save_dir / fname}")
 
     # Print table
