@@ -57,8 +57,8 @@ def train_ablation_run(config, aggregator, device):
         neighbors = generate_ring_topology(num_clients)
 
     num_byzantine = int(num_clients * byz_ratio)
-    honest_nodes = list(range(num_clients - num_byzantine))
-    byzantine_nodes = list(range(num_clients - num_byzantine, num_clients))
+    honest_nodes = set(range(num_clients - num_byzantine))
+    byzantine_nodes = set(range(num_clients - num_byzantine, num_clients))
 
     attack_type = os.getenv('ATTACK_TYPE', config['attack']['type'])
     if attack_type == 'gaussian':
@@ -74,14 +74,14 @@ def train_ablation_run(config, aggregator, device):
     optimizers = [torch.optim.SGD(m.parameters(), lr=lr) for m in models]
 
     for t in range(num_rounds):
-        local_vecs = []
+        local_vecs = [None] * num_clients
         for i in range(num_clients):
             model = models[i]
             if i in honest_nodes:
                 model.train()
                 for epoch in range(local_epochs):
                     for data, target in train_loaders[i]:
-                        data, target = data.to(device), target.to(device)
+                        data, target = data.to(device, non_blocking=True), target.to(device, non_blocking=True)
                         optimizer = optimizers[i]
                         optimizer.zero_grad()
                         output = model(data)
@@ -92,7 +92,7 @@ def train_ablation_run(config, aggregator, device):
                 model.train()
                 for epoch in range(local_epochs):
                     for data, target in train_loaders[i]:
-                        data, target = data.to(device), target.to(device)
+                        data, target = data.to(device, non_blocking=True), target.to(device, non_blocking=True)
                         target = attack.flip_labels(target)
                         optimizer = optimizers[i]
                         optimizer.zero_grad()
@@ -100,7 +100,7 @@ def train_ablation_run(config, aggregator, device):
                         loss = torch.nn.functional.cross_entropy(output, target)
                         loss.backward()
                         optimizer.step()
-            local_vecs.append(aggregator.model_to_vector(models[i]))
+            local_vecs[i] = aggregator.model_to_vector(models[i])
 
         if attack and not isinstance(attack, LabelFlippingAttack):
             honest_vecs = [local_vecs[i] for i in honest_nodes]
@@ -111,10 +111,11 @@ def train_ablation_run(config, aggregator, device):
                 for byz_id in byzantine_nodes:
                     local_vecs[byz_id] = attack.attack(local_vecs[byz_id])
 
-        updated_vecs = []
+        all_vecs = torch.stack(local_vecs)
+        updated_vecs = [None] * num_clients
         for i in range(num_clients):
             own_vec = local_vecs[i]
-            neighbor_vecs = [local_vecs[j] for j in neighbors[i]]
+            neighbor_vecs = all_vecs[neighbors[i]]
             if i in honest_nodes:
                 aggregated, agg_stats = aggregator.aggregate(
                     own_vec, neighbor_vecs, t=t, T=num_rounds, return_stats=True
@@ -123,7 +124,7 @@ def train_ablation_run(config, aggregator, device):
                 final_vec = aggregator.final_update(own_vec, aggregated, avg_trust=avg_trust)
             else:
                 final_vec = own_vec
-            updated_vecs.append(final_vec)
+            updated_vecs[i] = final_vec
 
         for i, vec in enumerate(updated_vecs):
             aggregator.load_from_vector(models[i], vec)
@@ -138,7 +139,7 @@ def train_ablation_run(config, aggregator, device):
     correct, total = 0, 0
     with torch.no_grad():
         for data, target in test_loader:
-            data, target = data.to(device), target.to(device)
+            data, target = data.to(device, non_blocking=True), target.to(device, non_blocking=True)
             pred = global_model(data).argmax(dim=1)
             correct += pred.eq(target).sum().item()
             total += target.size(0)

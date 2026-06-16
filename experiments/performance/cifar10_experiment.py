@@ -54,8 +54,8 @@ class CIFAR10Trainer:
 
         # 节点划分
         num_byzantine = int(self.num_clients * config['federated']['byzantine_ratio'])
-        self.honest_nodes = list(range(self.num_clients - num_byzantine))
-        self.byzantine_nodes = list(range(self.num_clients - num_byzantine, self.num_clients))
+        self.honest_nodes = set(range(self.num_clients - num_byzantine))
+        self.byzantine_nodes = set(range(self.num_clients - num_byzantine, self.num_clients))
 
         # 攻击（环境变量 ATTACK_TYPE 可覆盖配置文件）
         attack_type = os.getenv('ATTACK_TYPE', config['attack']['type'])
@@ -86,6 +86,7 @@ class CIFAR10Trainer:
                                       momentum=self.config['optimizer'].get('momentum', 0.0),
                                       weight_decay=self.config['optimizer'].get('weight_decay', 0.0))
                       for m in models]
+        eval_model = SimpleCNN(num_classes=10, in_channels=3).to(self.device)
 
         # 聚合器
         if method == 'sama':
@@ -115,7 +116,7 @@ class CIFAR10Trainer:
         pbar = tqdm(range(num_rounds), desc=f"{method.upper()}")
         for t in pbar:
             # 本地训练
-            local_vecs = []
+            local_vecs = [None] * self.num_clients
             for i in range(self.num_clients):
                 model = models[i]
 
@@ -124,7 +125,7 @@ class CIFAR10Trainer:
                     optimizer = optimizers[i]
                     for epoch in range(local_epochs):
                         for data, target in self.train_loaders[i]:
-                            data, target = data.to(self.device), target.to(self.device)
+                            data, target = data.to(self.device, non_blocking=True), target.to(self.device, non_blocking=True)
                             optimizer.zero_grad()
                             output = model(data)
                             loss = torch.nn.functional.cross_entropy(output, target)
@@ -135,7 +136,7 @@ class CIFAR10Trainer:
                     optimizer = optimizers[i]
                     for epoch in range(local_epochs):
                         for data, target in self.train_loaders[i]:
-                            data, target = data.to(self.device), target.to(self.device)
+                            data, target = data.to(self.device, non_blocking=True), target.to(self.device, non_blocking=True)
                             target = self.attack.flip_labels(target)
                             optimizer.zero_grad()
                             output = model(data)
@@ -143,7 +144,7 @@ class CIFAR10Trainer:
                             loss.backward()
                             optimizer.step()
 
-                local_vecs.append(aggregator.model_to_vector(models[i]))
+                local_vecs[i] = aggregator.model_to_vector(models[i])
 
             # 拜占庭攻击（非Label Flipping类型）
             if self.attack and not isinstance(self.attack, LabelFlippingAttack):
@@ -156,10 +157,11 @@ class CIFAR10Trainer:
                         local_vecs[byz_id] = self.attack.attack(local_vecs[byz_id])
 
             # 聚合
-            updated_vecs = []
+            all_vecs = torch.stack(local_vecs)
+            updated_vecs = [None] * self.num_clients
             for i in range(self.num_clients):
                 own_vec = local_vecs[i]
-                neighbor_vecs = [local_vecs[j] for j in self.neighbors[i]]
+                neighbor_vecs = all_vecs[self.neighbors[i]]
 
                 if i in self.honest_nodes:
                     aggregated, agg_stats = aggregator.aggregate(
@@ -170,7 +172,7 @@ class CIFAR10Trainer:
                 else:
                     final_vec = own_vec
 
-                updated_vecs.append(final_vec)
+                updated_vecs[i] = final_vec
 
             for i, vec in enumerate(updated_vecs):
                 aggregator.load_from_vector(models[i], vec)
@@ -184,7 +186,7 @@ class CIFAR10Trainer:
                 D_t = torch.mean(torch.norm(honest_vecs_t - honest_mean, dim=1).pow(2)).item()
 
                 # 测试
-                global_model = SimpleCNN(num_classes=10, in_channels=3).to(self.device)
+                global_model = eval_model
                 aggregator.load_from_vector(global_model, honest_mean)
                 global_model.eval()
 

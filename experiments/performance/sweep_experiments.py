@@ -85,7 +85,7 @@ def train_single_run(config, method, device, neighbors=None, progress_queue=None
     if isinstance(device, str):
         device = torch.device(device)
     # spawn子进程里禁用DataLoader多进程，防止进程数爆炸
-    config['federated']['num_workers'] = 0
+    num_workers = 0
     num_clients = config['federated']['num_clients']
     byz_ratio = config['federated']['byzantine_ratio']
     num_rounds = config['federated']['num_rounds']
@@ -98,7 +98,7 @@ def train_single_run(config, method, device, neighbors=None, progress_queue=None
         num_clients=num_clients,
         alpha=config['data']['non_iid_alpha'],
         batch_size=config['federated']['batch_size'],
-        num_workers=config['federated'].get('num_workers', 2)
+        num_workers=num_workers
     )
 
     # 使用外部传入的拓扑；否则生成
@@ -111,8 +111,8 @@ def train_single_run(config, method, device, neighbors=None, progress_queue=None
 
     # Node split
     num_byzantine = int(num_clients * byz_ratio)
-    honest_nodes = list(range(num_clients - num_byzantine))
-    byzantine_nodes = list(range(num_clients - num_byzantine, num_clients))
+    honest_nodes = set(range(num_clients - num_byzantine))
+    byzantine_nodes = set(range(num_clients - num_byzantine, num_clients))
 
     # Attack
     attack_type = os.getenv('ATTACK_TYPE', config['attack']['type'])
@@ -138,7 +138,7 @@ def train_single_run(config, method, device, neighbors=None, progress_queue=None
 
     # Training
     for t in range(num_rounds):
-        local_vecs = []
+        local_vecs = [None] * num_clients
         for i in range(num_clients):
             model = models[i]
             optimizer = optimizers[i]
@@ -147,7 +147,7 @@ def train_single_run(config, method, device, neighbors=None, progress_queue=None
                 model.train()
                 for epoch in range(local_epochs):
                     for data, target in train_loaders[i]:
-                        data, target = data.to(device), target.to(device)
+                        data, target = data.to(device, non_blocking=True), target.to(device, non_blocking=True)
                         optimizer.zero_grad()
                         output = model(data)
                         loss = torch.nn.functional.cross_entropy(output, target)
@@ -157,7 +157,7 @@ def train_single_run(config, method, device, neighbors=None, progress_queue=None
                 model.train()
                 for epoch in range(local_epochs):
                     for data, target in train_loaders[i]:
-                        data, target = data.to(device), target.to(device)
+                        data, target = data.to(device, non_blocking=True), target.to(device, non_blocking=True)
                         target = attack.flip_labels(target)
                         optimizer.zero_grad()
                         output = model(data)
@@ -165,7 +165,7 @@ def train_single_run(config, method, device, neighbors=None, progress_queue=None
                         loss.backward()
                         optimizer.step()
 
-            local_vecs.append(aggregator.model_to_vector(models[i]))
+            local_vecs[i] = aggregator.model_to_vector(models[i])
 
         # Post-training attacks
         if attack and not isinstance(attack, LabelFlippingAttack):
@@ -178,10 +178,11 @@ def train_single_run(config, method, device, neighbors=None, progress_queue=None
                     local_vecs[byz_id] = attack.attack(local_vecs[byz_id])
 
         # Aggregation
-        updated_vecs = []
+        all_vecs = torch.stack(local_vecs)
+        updated_vecs = [None] * num_clients
         for i in range(num_clients):
             own_vec = local_vecs[i]
-            neighbor_vecs = [local_vecs[j] for j in neighbors[i]]
+            neighbor_vecs = all_vecs[neighbors[i]]
 
             if i in honest_nodes:
                 aggregated, agg_stats = aggregator.aggregate(
@@ -191,7 +192,7 @@ def train_single_run(config, method, device, neighbors=None, progress_queue=None
                 final_vec = aggregator.final_update(own_vec, aggregated, avg_trust=avg_trust)
             else:
                 final_vec = own_vec
-            updated_vecs.append(final_vec)
+            updated_vecs[i] = final_vec
 
         for i, vec in enumerate(updated_vecs):
             aggregator.load_from_vector(models[i], vec)
@@ -211,7 +212,7 @@ def train_single_run(config, method, device, neighbors=None, progress_queue=None
     correct, total = 0, 0
     with torch.no_grad():
         for data, target in test_loader:
-            data, target = data.to(device), target.to(device)
+            data, target = data.to(device, non_blocking=True), target.to(device, non_blocking=True)
             pred = global_model(data).argmax(dim=1)
             correct += pred.eq(target).sum().item()
             total += target.size(0)

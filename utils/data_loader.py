@@ -66,7 +66,7 @@ def dirichlet_partition(dataset, num_clients, alpha=0.1, num_classes=10):
         List[List[int]] - 每个客户端的数据索引
     """
     # 按类别组织数据索引
-    labels = np.array([dataset[i][1] for i in range(len(dataset))])
+    labels = np.array(dataset.targets)
     class_indices = [np.where(labels == c)[0] for c in range(num_classes)]
 
     # 为每个客户端分配数据
@@ -126,7 +126,9 @@ def load_mnist(data_dir='./data', num_clients=20, alpha=0.1, batch_size=32, num_
             batch_size=min(batch_size, len(indices)),  # batch_size不能超过样本数
             shuffle=True,
             num_workers=num_workers,
-            pin_memory=True  # GPU传输优化
+            pin_memory=True,
+            persistent_workers=num_workers > 0,
+            prefetch_factor=4 if num_workers > 0 else None,
         )
         train_loaders.append(loader)
 
@@ -136,7 +138,9 @@ def load_mnist(data_dir='./data', num_clients=20, alpha=0.1, batch_size=32, num_
         batch_size=batch_size * 2,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=4 if num_workers > 0 else None,
     )
 
     return train_loaders, test_loader
@@ -181,7 +185,9 @@ def load_cifar10(data_dir='./data', num_clients=20, alpha=0.1, batch_size=32, nu
             batch_size=min(batch_size, len(indices)),  # batch_size不能超过样本数
             shuffle=True,
             num_workers=num_workers,
-            pin_memory=True
+            pin_memory=True,
+            persistent_workers=num_workers > 0,
+            prefetch_factor=4 if num_workers > 0 else None,
         )
         train_loaders.append(loader)
 
@@ -190,7 +196,9 @@ def load_cifar10(data_dir='./data', num_clients=20, alpha=0.1, batch_size=32, nu
         batch_size=batch_size * 2,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=4 if num_workers > 0 else None,
     )
 
     return train_loaders, test_loader

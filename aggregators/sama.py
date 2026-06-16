@@ -102,13 +102,12 @@ class SAMAAggregator(BaseAggregator):
         agg_vec = (valid_phi.unsqueeze(1) * aligned).sum(dim=0) / total_weight
 
         if return_stats:
-            phi_vals = valid_phi.cpu().float()
             stats = {
                 'num_neighbors': N,
-                'num_filtered': N - int(valid.sum().item()),
-                'avg_trust': float(phi_vals.mean()),
-                'min_trust': float(phi_vals.min()),
-                'max_trust': float(phi_vals.max()),
+                'num_filtered': N - int(valid.sum()),
+                'avg_trust': valid_phi.mean().item(),
+                'min_trust': valid_phi.min().item(),
+                'max_trust': valid_phi.max().item(),
                 'tau': tau,
             }
             return agg_vec, stats

@@ -53,8 +53,8 @@ def measure_convergence_rate(num_clients=None, byzantine_ratio=None,
     neighbors = generate_ring_topology(num_clients)
 
     num_byzantine = int(num_clients * byzantine_ratio)
-    honest_nodes = list(range(num_clients - num_byzantine))
-    byzantine_nodes = list(range(num_clients - num_byzantine, num_clients))
+    honest_nodes = set(range(num_clients - num_byzantine))
+    byzantine_nodes = set(range(num_clients - num_byzantine, num_clients))
 
     models = [SimpleCNN().to(device) for _ in range(num_clients)]
     optimizers = [torch.optim.SGD(m.parameters(), lr=lr) for m in models]
@@ -63,7 +63,7 @@ def measure_convergence_rate(num_clients=None, byzantine_ratio=None,
     consensus_errors = []  # D_t = (1/|H|)Σ||w_i - w̄_H||²
 
     for t in range(num_rounds):
-        local_vecs = []
+        local_vecs = [None] * num_clients
         for i in range(num_clients):
             model = models[i]
             model.train()
@@ -71,7 +71,7 @@ def measure_convergence_rate(num_clients=None, byzantine_ratio=None,
             if i in honest_nodes:
                 try:
                     data, target = next(iter(train_loaders[i]))
-                    data, target = data.to(device), target.to(device)
+                    data, target = data.to(device, non_blocking=True), target.to(device, non_blocking=True)
 
                     optimizer = optimizers[i]
                     optimizer.zero_grad()
@@ -82,15 +82,16 @@ def measure_convergence_rate(num_clients=None, byzantine_ratio=None,
                 except:
                     pass
 
-            local_vecs.append(aggregator.model_to_vector(models[i]))
+            local_vecs[i] = aggregator.model_to_vector(models[i])
 
         for byz_id in byzantine_nodes:
             local_vecs[byz_id] = local_vecs[byz_id] + torch.randn_like(local_vecs[byz_id]) * _tv_cfg['gaussian_attack_std']
 
-        updated_vecs = []
+        all_vecs = torch.stack(local_vecs)
+        updated_vecs = [None] * num_clients
         for i in range(num_clients):
             own_vec = local_vecs[i]
-            neighbor_vecs = [local_vecs[j] for j in neighbors[i]]
+            neighbor_vecs = all_vecs[neighbors[i]]
 
             if i in honest_nodes:
                 aggregated = aggregator.aggregate(own_vec, neighbor_vecs, t=t, T=num_rounds)
@@ -98,7 +99,7 @@ def measure_convergence_rate(num_clients=None, byzantine_ratio=None,
             else:
                 final_vec = own_vec
 
-            updated_vecs.append(final_vec)
+            updated_vecs[i] = final_vec
 
         for i, vec in enumerate(updated_vecs):
             aggregator.load_from_vector(models[i], vec)

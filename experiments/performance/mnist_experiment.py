@@ -64,8 +64,8 @@ class FederatedTrainer:
 
         # 节点划分
         num_byzantine = int(self.num_clients * config['federated']['byzantine_ratio'])
-        self.honest_nodes = list(range(self.num_clients - num_byzantine))
-        self.byzantine_nodes = list(range(self.num_clients - num_byzantine, self.num_clients))
+        self.honest_nodes = set(range(self.num_clients - num_byzantine))
+        self.byzantine_nodes = set(range(self.num_clients - num_byzantine, self.num_clients))
 
         print(f"Honest nodes: {len(self.honest_nodes)}, Byzantine nodes: {len(self.byzantine_nodes)}")
 
@@ -101,6 +101,7 @@ class FederatedTrainer:
         # 初始化模型
         models = [SimpleCNN().to(self.device) for _ in range(self.num_clients)]
         optimizers = [torch.optim.SGD(m.parameters(), lr=lr) for m in models]
+        eval_model = SimpleCNN().to(self.device)
 
         # 初始化聚合器
         if method == 'sama':
@@ -164,7 +165,7 @@ class FederatedTrainer:
         pbar = tqdm(range(num_rounds), desc=f"{method.upper()} training")
         for t in pbar:
             # 本地训练
-            local_vecs = []
+            local_vecs = [None] * self.num_clients
             for i in range(self.num_clients):
                 model = models[i]
 
@@ -173,7 +174,7 @@ class FederatedTrainer:
                     model.train()
                     for epoch in range(local_epochs):
                         for data, target in self.train_loaders[i]:
-                            data, target = data.to(self.device), target.to(self.device)
+                            data, target = data.to(self.device, non_blocking=True), target.to(self.device, non_blocking=True)
 
                             optimizer = optimizers[i]
                             optimizer.zero_grad()
@@ -186,7 +187,7 @@ class FederatedTrainer:
                     model.train()
                     for epoch in range(local_epochs):
                         for data, target in self.train_loaders[i]:
-                            data, target = data.to(self.device), target.to(self.device)
+                            data, target = data.to(self.device, non_blocking=True), target.to(self.device, non_blocking=True)
                             target = self.attack.flip_labels(target)
 
                             optimizer = optimizers[i]
@@ -196,7 +197,7 @@ class FederatedTrainer:
                             loss.backward()
                             optimizer.step()
 
-                local_vecs.append(aggregator.model_to_vector(models[i]))
+                local_vecs[i] = aggregator.model_to_vector(models[i])
 
             # 拜占庭攻击（非Label Flipping类型在训练后修改模型参数）
             if self.attack and not isinstance(self.attack, LabelFlippingAttack):
@@ -209,10 +210,11 @@ class FederatedTrainer:
                         local_vecs[byz_id] = self.attack.attack(local_vecs[byz_id])
 
             # 去中心化聚合
-            updated_vecs = []
+            all_vecs = torch.stack(local_vecs)
+            updated_vecs = [None] * self.num_clients
             for i in range(self.num_clients):
                 own_vec = local_vecs[i]
-                neighbor_vecs = [local_vecs[j] for j in self.neighbors[i]]
+                neighbor_vecs = all_vecs[self.neighbors[i]]
 
                 if i in self.honest_nodes:
                     aggregated, agg_stats = aggregator.aggregate(
@@ -223,7 +225,7 @@ class FederatedTrainer:
                 else:
                     final_vec = own_vec
 
-                updated_vecs.append(final_vec)
+                updated_vecs[i] = final_vec
 
             # 更新模型
             for i, vec in enumerate(updated_vecs):
@@ -239,9 +241,8 @@ class FederatedTrainer:
                 D_t = torch.mean(torch.norm(honest_vecs - honest_mean, dim=1).pow(2)).item()
 
                 # 测试
-                global_model = SimpleCNN().to(self.device)
-                aggregator.load_from_vector(global_model, honest_mean)
-                global_model.eval()
+                aggregator.load_from_vector(eval_model, honest_mean)
+                eval_model.eval()
 
                 correct = 0
                 total = 0
@@ -250,7 +251,7 @@ class FederatedTrainer:
                 with torch.no_grad():
                     for data, target in self.test_loader:
                         data, target = data.to(self.device), target.to(self.device)
-                        output = global_model(data)
+                        output = eval_model(data)
                         loss_sum += torch.nn.functional.cross_entropy(output, target, reduction='sum').item()
                         pred = output.argmax(dim=1)
                         correct += pred.eq(target).sum().item()

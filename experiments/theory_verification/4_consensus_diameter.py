@@ -63,8 +63,8 @@ def measure_consensus_diameter(method='sama', num_clients=None, byzantine_ratio=
     neighbors = generate_ring_topology(num_clients)
 
     num_byzantine = int(num_clients * byzantine_ratio)
-    honest_nodes = list(range(num_clients - num_byzantine))
-    byzantine_nodes = list(range(num_clients - num_byzantine, num_clients))
+    honest_nodes = set(range(num_clients - num_byzantine))
+    byzantine_nodes = set(range(num_clients - num_byzantine, num_clients))
 
     gamma = compute_spectral_gap(neighbors, honest_nodes)
     print(f"Honest subgraph spectral gap γ = {gamma:.4f}")
@@ -84,7 +84,7 @@ def measure_consensus_diameter(method='sama', num_clients=None, byzantine_ratio=
     diameter_history = []  # max_{i,j∈H} ||w_i - w_j||
 
     for t in range(num_rounds):
-        local_vecs = []
+        local_vecs = [None] * num_clients
         for i in range(num_clients):
             model = models[i]
             model.train()
@@ -92,7 +92,7 @@ def measure_consensus_diameter(method='sama', num_clients=None, byzantine_ratio=
             if i in honest_nodes:
                 try:
                     data, target = next(iter(train_loaders[i]))
-                    data, target = data.to(device), target.to(device)
+                    data, target = data.to(device, non_blocking=True), target.to(device, non_blocking=True)
 
                     optimizer = optimizers[i]
                     optimizer.zero_grad()
@@ -103,15 +103,16 @@ def measure_consensus_diameter(method='sama', num_clients=None, byzantine_ratio=
                 except:
                     pass
 
-            local_vecs.append(aggregator.model_to_vector(models[i]))
+            local_vecs[i] = aggregator.model_to_vector(models[i])
 
         for byz_id in byzantine_nodes:
             local_vecs[byz_id] = local_vecs[byz_id] + torch.randn_like(local_vecs[byz_id]) * _tv_cfg['gaussian_attack_std']
 
-        updated_vecs = []
+        all_vecs = torch.stack(local_vecs)
+        updated_vecs = [None] * num_clients
         for i in range(num_clients):
             own_vec = local_vecs[i]
-            neighbor_vecs = [local_vecs[j] for j in neighbors[i]]
+            neighbor_vecs = all_vecs[neighbors[i]]
 
             if i in honest_nodes:
                 aggregated = aggregator.aggregate(own_vec, neighbor_vecs, t=t, T=num_rounds)
@@ -119,19 +120,15 @@ def measure_consensus_diameter(method='sama', num_clients=None, byzantine_ratio=
             else:
                 final_vec = own_vec
 
-            updated_vecs.append(final_vec)
+            updated_vecs[i] = final_vec
 
         for i, vec in enumerate(updated_vecs):
             aggregator.load_from_vector(models[i], vec)
 
         honest_vecs = [updated_vecs[i] for i in honest_nodes]
 
-        max_dist = 0
-        for i, vec_i in enumerate(honest_vecs):
-            for j, vec_j in enumerate(honest_vecs):
-                if i < j:
-                    dist = torch.norm(vec_i - vec_j).item()
-                    max_dist = max(max_dist, dist)
+        honest_mat = torch.stack(honest_vecs)
+        max_dist = torch.cdist(honest_mat, honest_mat).max().item()
 
         diameter_history.append(max_dist)
 
