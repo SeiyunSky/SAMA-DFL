@@ -13,6 +13,16 @@ class NoAttack:
         return own_vec
 
 
+class BrokenNodeAttack:
+    """
+    节点损坏：拜占庭节点不进行本地训练，参数停留在上一轮聚合后的状态，
+    但仍参与去中心化聚合（被邻居读取）。
+    无 attack() 方法，trainer 通过 isinstance 检测后跳过本地训练。
+    """
+    def __init__(self):
+        self.name = "BrokenNode"
+
+
 class GaussianAttack:
     def __init__(self, std=10.0):
         self.std = std
@@ -137,6 +147,7 @@ ATTACK_REGISTRY = {
     'omniscient': OmniscientAttack,
     'krum_attack': KrumAttack,
     'trim_attack': TrimAttack,
+    'broken_node': BrokenNodeAttack,
 }
 
 

@@ -28,8 +28,9 @@ from aggregators import (SAMAAggregator, BALANCEAggregator, SCCLIPAggregator,
                          FedAvgAggregator, KrumAggregator, TrimmedMeanAggregator,
                          CoordMedianAggregator)
 from models import SimpleCNN
-from utils import load_mnist, generate_ring_topology
-from attacks import GaussianAttack, LabelFlippingAttack, OmniscientAttack, KrumAttack, TrimAttack
+from utils import load_mnist, load_mnist_gpu, generate_ring_topology
+from attacks import (GaussianAttack, LabelFlippingAttack, OmniscientAttack,
+                     KrumAttack, TrimAttack, BrokenNodeAttack, NoAttack)
 from collections import OrderedDict
 
 
@@ -40,15 +41,25 @@ class FederatedTrainer:
         self.config = config
         self.device = torch.device(config['experiment']['device'])
 
-        # 数据加载 - vGPU优化
-        num_workers = config.get('federated', {}).get('num_workers', 8)
-        self.train_loaders, self.test_loader = load_mnist(
-            data_dir=config['data']['data_dir'],
-            num_clients=config['federated']['num_clients'],
-            alpha=config['data']['non_iid_alpha'],
-            batch_size=config['federated']['batch_size'],
-            num_workers=num_workers
-        )
+        # 数据加载 - GPU 预加载（默认开启，比 CPU DataLoader 快 5-10x）
+        use_gpu_loader = bool(int(os.getenv('GPU_LOADER', '1')))
+        if use_gpu_loader:
+            self.train_loaders, self.test_loader = load_mnist_gpu(
+                data_dir=config['data']['data_dir'],
+                num_clients=config['federated']['num_clients'],
+                alpha=config['data']['non_iid_alpha'],
+                batch_size=config['federated']['batch_size'],
+                device=str(self.device),
+            )
+        else:
+            num_workers = config.get('federated', {}).get('num_workers', 8)
+            self.train_loaders, self.test_loader = load_mnist(
+                data_dir=config['data']['data_dir'],
+                num_clients=config['federated']['num_clients'],
+                alpha=config['data']['non_iid_alpha'],
+                batch_size=config['federated']['batch_size'],
+                num_workers=num_workers
+            )
 
         # 网络拓扑
         self.num_clients = config['federated']['num_clients']
@@ -83,6 +94,8 @@ class FederatedTrainer:
         elif attack_type == 'trim_attack':
             self.attack = TrimAttack(num_byzantine=num_byzantine,
                                      trim_ratio=config['attack'].get('trim_ratio', 0.1))
+        elif attack_type == 'broken_node':
+            self.attack = BrokenNodeAttack()
         else:
             self.attack = None
 
@@ -100,6 +113,7 @@ class FederatedTrainer:
 
         # 初始化模型
         models = [SimpleCNN().to(self.device) for _ in range(self.num_clients)]
+        lr = self.config['optimizer']['lr']
         optimizers = [torch.optim.SGD(m.parameters(), lr=lr) for m in models]
         eval_model = SimpleCNN().to(self.device)
 
@@ -160,7 +174,6 @@ class FederatedTrainer:
 
         num_rounds = self.config['federated']['num_rounds']
         local_epochs = self.config['federated']['local_epochs']
-        lr = self.config['optimizer']['lr']
 
         # 训练循环
         pbar = tqdm(range(num_rounds), desc=f"{method.upper()} training")
@@ -170,7 +183,9 @@ class FederatedTrainer:
             for i in range(self.num_clients):
                 model = models[i]
 
-                if i in self.honest_nodes:
+                # attack=None（NoAttack 等价）时所有节点都正常训练
+                is_training_node = (i in self.honest_nodes) or self.attack is None or isinstance(self.attack, NoAttack)
+                if is_training_node:
                     # 诚实节点正常训练
                     model.train()
                     for epoch in range(local_epochs):
@@ -200,8 +215,10 @@ class FederatedTrainer:
 
                 local_vecs[i] = aggregator.model_to_vector(models[i])
 
-            # 拜占庭攻击（非Label Flipping类型在训练后修改模型参数）
-            if self.attack and not isinstance(self.attack, LabelFlippingAttack):
+            # 拜占庭攻击（Label Flipping 已在本地训练阶段处理；
+            # BrokenNodeAttack 不修改参数，仅跳过本地训练）
+            if (self.attack
+                    and not isinstance(self.attack, (LabelFlippingAttack, BrokenNodeAttack))):
                 honest_vecs_atk = [local_vecs[i] for i in self.honest_nodes]
                 if isinstance(self.attack, (OmniscientAttack, KrumAttack, TrimAttack)):
                     for byz_id in self.byzantine_nodes:
@@ -213,11 +230,13 @@ class FederatedTrainer:
             # 去中心化聚合
             all_vecs = torch.stack(local_vecs)
             updated_vecs = [None] * self.num_clients
+            no_attack = (self.attack is None) or isinstance(self.attack, NoAttack)
             for i in range(self.num_clients):
                 own_vec = local_vecs[i]
                 neighbor_vecs = all_vecs[self.neighbors[i]]
 
-                if i in self.honest_nodes:
+                # attack=None 时所有节点都参与聚合
+                if (i in self.honest_nodes) or no_attack:
                     aggregated, agg_stats = aggregator.aggregate(
                         own_vec, neighbor_vecs, t=t, T=num_rounds, return_stats=True
                     )
@@ -234,8 +253,9 @@ class FederatedTrainer:
 
             # 评估（每log_interval轮）
             if (t + 1) % self.config['logging']['log_interval'] == 0:
-                # 计算共识误差
-                honest_vecs = [updated_vecs[i] for i in self.honest_nodes]
+                # 计算共识误差（attack=None 时全部节点；否则仅诚实节点）
+                eval_indices = list(range(self.num_clients)) if no_attack else list(self.honest_nodes)
+                honest_vecs = [updated_vecs[i] for i in eval_indices]
 
                 honest_vecs = torch.stack(honest_vecs)
                 honest_mean = honest_vecs.mean(dim=0)
@@ -267,6 +287,10 @@ class FederatedTrainer:
 
                 pbar.set_postfix({'loss': f'{test_loss:.4f}', 'acc': f'{test_acc:.2f}%'})
 
+        # 释放该 method 的训练资源（数据集 self.train_loaders 跨 method 复用，不释放）
+        del models, eval_model, optimizers, aggregator
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return history
 
 

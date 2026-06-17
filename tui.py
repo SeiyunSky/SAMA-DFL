@@ -216,6 +216,28 @@ EXPERIMENTS = {
 
 PERF_GROUPS = {'B'}
 NO_ATTACK_PROMPT = {'multi_attack_table', 'cifar10_attack_table', 'client_scale'}
+TABLE_ATTACK_PROMPT = {'multi_attack_table', 'cifar10_attack_table'}
+
+ALL_ATTACKS = [
+    ('none',           'No Attack'),
+    ('gaussian',       'Gaussian'),
+    ('label_flipping', 'Label Flipping'),
+    ('omniscient',     'Omniscient'),
+    ('krum_attack',    'Krum Attack'),
+    ('trim_attack',    'Trim Attack'),
+    ('broken_node',    'Broken Node'),
+]
+
+ALL_METHODS = [
+    ('sama',         'SAMA'),
+    ('balance',      'BALANCE'),
+    ('scclip',       'SC-CLIP'),
+    ('fedavg',       'FedAvg'),
+    ('krum',         'Krum'),
+    ('multi_krum',   'Multi-Krum'),
+    ('trimmed_mean', 'Trim-Mean'),
+    ('coord_median', 'CoordMed'),
+]
 
 
 # ──────────────────────────────────────────────────────────
@@ -223,10 +245,11 @@ NO_ATTACK_PROMPT = {'multi_attack_table', 'cifar10_attack_table', 'client_scale'
 # ──────────────────────────────────────────────────────────
 
 class ExperimentRunner:
-    def __init__(self, exp_key, label, attack=None):
+    def __init__(self, exp_key, label, attack=None, extra_env=None):
         self.exp_key = exp_key
         self.label = label
         self.attack = attack
+        self.extra_env = extra_env or {}
         self.running = False
         self.done = False
         self.returncode = None
@@ -241,6 +264,8 @@ class ExperimentRunner:
         env = os.environ.copy()
         if self.attack:
             env['ATTACK_TYPE'] = self.attack
+        for k, v in self.extra_env.items():
+            env[k] = v
         cmd = [sys.executable, '-u', str(PROJ_DIR / 'run_experiments.py'),
                '--experiment', self.exp_key]
         self.proc = subprocess.Popen(
@@ -458,8 +483,8 @@ def render_menu():
 # 单个实验（单独运行时仍保留 Live 输出）
 # ──────────────────────────────────────────────────────────
 
-def run_single(exp_key, label, attack=None):
-    job = ExperimentRunner(exp_key, label, attack)
+def run_single(exp_key, label, attack=None, extra_env=None):
+    job = ExperimentRunner(exp_key, label, attack, extra_env=extra_env)
     job.start()
 
     try:
@@ -514,16 +539,76 @@ def choose_attack():
     console.print("[bold]选择攻击类型[/bold]（留空使用配置文件默认值）")
     console.print("  [cyan]1[/cyan] Gaussian        [cyan]2[/cyan] Label Flipping")
     console.print("  [cyan]3[/cyan] Omniscient      [cyan]4[/cyan] Krum Attack")
-    console.print("  [cyan]5[/cyan] Trim Attack")
+    console.print("  [cyan]5[/cyan] Trim Attack     [cyan]6[/cyan] Broken Node")
     choice = Prompt.ask("攻击", default="").strip()
     mapping = {
         '1': 'gaussian', '2': 'label_flipping',
         '3': 'omniscient', '4': 'krum_attack', '5': 'trim_attack',
+        '6': 'broken_node',
         'gaussian': 'gaussian', 'label_flipping': 'label_flipping',
         'omniscient': 'omniscient', 'krum_attack': 'krum_attack',
-        'trim_attack': 'trim_attack',
+        'trim_attack': 'trim_attack', 'broken_node': 'broken_node',
     }
     return mapping.get(choice, None)
+
+
+def choose_attacks_multi():
+    """多攻击表格场景下，让用户多选要跑的攻击。
+    返回逗号分隔字符串（空字符串=跑全部 7 个）。
+    """
+    console.print()
+    console.print("[bold]选择本次要跑的攻击[/bold]（多选，用逗号或空格分隔；留空 / a / all = 全部）")
+    for idx, (key, label) in enumerate(ALL_ATTACKS, start=1):
+        console.print(f"  [cyan]{idx}[/cyan] {label}  [dim]({key})[/dim]")
+    raw = Prompt.ask("攻击编号", default="").strip().lower()
+    if raw in ('', 'a', 'all'):
+        return ''
+    tokens = [t for t in raw.replace(',', ' ').split() if t]
+    selected = []
+    for t in tokens:
+        if t.isdigit():
+            i = int(t)
+            if 1 <= i <= len(ALL_ATTACKS):
+                selected.append(ALL_ATTACKS[i - 1][0])
+        elif any(t == k for k, _ in ALL_ATTACKS):
+            selected.append(t)
+    if not selected:
+        console.print("[yellow]未识别有效攻击，回退为全部[/yellow]")
+        return ''
+    # 去重保序
+    seen = set()
+    unique = [a for a in selected if not (a in seen or seen.add(a))]
+    console.print(f"[green]已选: {', '.join(unique)}[/green]")
+    return ','.join(unique)
+
+
+def choose_methods_multi():
+    """多攻击表格场景下，让用户多选要跑的算法。
+    返回逗号分隔字符串（空字符串=跑全部 8 个）。
+    """
+    console.print()
+    console.print("[bold]选择本次要跑的算法[/bold]（多选，用逗号或空格分隔；留空 / a / all = 全部）")
+    for idx, (key, label) in enumerate(ALL_METHODS, start=1):
+        console.print(f"  [cyan]{idx}[/cyan] {label}  [dim]({key})[/dim]")
+    raw = Prompt.ask("算法编号", default="").strip().lower()
+    if raw in ('', 'a', 'all'):
+        return ''
+    tokens = [t for t in raw.replace(',', ' ').split() if t]
+    selected = []
+    for t in tokens:
+        if t.isdigit():
+            i = int(t)
+            if 1 <= i <= len(ALL_METHODS):
+                selected.append(ALL_METHODS[i - 1][0])
+        elif any(t == k for k, _ in ALL_METHODS):
+            selected.append(t)
+    if not selected:
+        console.print("[yellow]未识别有效算法，回退为全部[/yellow]")
+        return ''
+    seen = set()
+    unique = [a for a in selected if not (a in seen or seen.add(a))]
+    console.print(f"[green]已选: {', '.join(unique)}[/green]")
+    return ','.join(unique)
 
 
 # ──────────────────────────────────────────────────────────
@@ -594,8 +679,21 @@ def main():
             continue
 
         exp_key, label, needs_attack = result
-        attack = choose_attack() if needs_attack else None
-        run_single(exp_key, label, attack)
+        extra_env = None
+        if exp_key in TABLE_ATTACK_PROMPT:
+            attacks_csv = choose_attacks_multi()
+            methods_csv = choose_methods_multi()
+            attack = None  # 由 TABLE_ATTACKS 控制
+            extra_env = {}
+            if attacks_csv:
+                extra_env['TABLE_ATTACKS'] = attacks_csv
+            if methods_csv:
+                extra_env['TABLE_METHODS'] = methods_csv
+            if not extra_env:
+                extra_env = None
+        else:
+            attack = choose_attack() if needs_attack else None
+        run_single(exp_key, label, attack, extra_env=extra_env)
 
         console.print()
         console.print(render_results_table())
