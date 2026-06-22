@@ -25,9 +25,11 @@ from aggregators import (SAMAAggregator, BALANCEAggregator, SCCLIPAggregator,
                          FedAvgAggregator, KrumAggregator, TrimmedMeanAggregator,
                          CoordMedianAggregator)
 from models import SimpleCNN
-from utils import load_mnist, generate_ring_topology
+from utils import load_mnist, load_mnist_gpu, generate_ring_topology
+from utils import make_run_log_dir, open_task_log, append_task_log, finalize_task_log
 from utils.topology import generate_mesh_topology
-from attacks import GaussianAttack, LabelFlippingAttack, OmniscientAttack, KrumAttack, TrimAttack
+from attacks import (GaussianAttack, LabelFlippingAttack, OmniscientAttack,
+                     KrumAttack, TrimAttack, BrokenNodeAttack, NoAttack)
 from collections import OrderedDict
 
 
@@ -77,30 +79,41 @@ def create_aggregator(method, config, model_template=None):
         raise ValueError(f"Unknown method: {method}")
 
 
-def train_single_run(config, method, device, neighbors=None, progress_queue=None, task_label=None):
+def train_single_run(config, method, device, neighbors=None, progress_queue=None,
+                     task_label=None, log_dir=None, run_meta=None):
     """
     Run a single training experiment, return final accuracy.
-    Simplified version of FederatedTrainer for sweep use.
     """
+    import time
+    t_start = time.time()
     # 支持字符串（spawn子进程跨进程传递），也支持 torch.device 对象
     if isinstance(device, str):
         device = torch.device(device)
-    # spawn子进程里禁用DataLoader多进程，防止进程数爆炸
-    num_workers = 0
+
     num_clients = config['federated']['num_clients']
     byz_ratio = config['federated']['byzantine_ratio']
     num_rounds = config['federated']['num_rounds']
     local_epochs = config['federated']['local_epochs']
     lr = config['optimizer']['lr']
 
-    # Data
-    train_loaders, test_loader = load_mnist(
-        data_dir=config['data']['data_dir'],
-        num_clients=num_clients,
-        alpha=config['data']['non_iid_alpha'],
-        batch_size=config['federated']['batch_size'],
-        num_workers=num_workers
-    )
+    # Data — GPU 预加载（环境变量 GPU_LOADER=0 可降级到 CPU DataLoader）
+    use_gpu_loader = bool(int(os.getenv('GPU_LOADER', '1')))
+    if use_gpu_loader:
+        train_loaders, test_loader = load_mnist_gpu(
+            data_dir=config['data']['data_dir'],
+            num_clients=num_clients,
+            alpha=config['data']['non_iid_alpha'],
+            batch_size=config['federated']['batch_size'],
+            device=str(device),
+        )
+    else:
+        train_loaders, test_loader = load_mnist(
+            data_dir=config['data']['data_dir'],
+            num_clients=num_clients,
+            alpha=config['data']['non_iid_alpha'],
+            batch_size=config['federated']['batch_size'],
+            num_workers=0,
+        )
 
     # 使用外部传入的拓扑；否则生成
     if neighbors is None:
@@ -116,7 +129,8 @@ def train_single_run(config, method, device, neighbors=None, progress_queue=None
     byzantine_nodes = set(range(num_clients - num_byzantine, num_clients))
 
     # Attack
-    attack_type = os.getenv('ATTACK_TYPE', config['attack']['type'])
+    attack_type = os.getenv('ATTACK_TYPE', config['attack']['type']).lower()
+    num_byzantine = int(num_clients * byz_ratio)
     if attack_type == 'gaussian':
         attack = GaussianAttack(std=config['attack']['gaussian_std'])
     elif attack_type == 'label_flipping':
@@ -129,13 +143,26 @@ def train_single_run(config, method, device, neighbors=None, progress_queue=None
     elif attack_type == 'trim_attack':
         attack = TrimAttack(num_byzantine=num_byzantine,
                             trim_ratio=config['attack'].get('trim_ratio', 0.1))
+    elif attack_type == 'broken_node':
+        attack = BrokenNodeAttack()
+    elif attack_type == 'none':
+        attack = NoAttack()
     else:
-        attack = None
+        attack = NoAttack()
 
     # Models and aggregator
     models = [SimpleCNN().to(device) for _ in range(num_clients)]
     optimizers = [torch.optim.SGD(m.parameters(), lr=lr) for m in models]
     aggregator = create_aggregator(method, config, model_template=models[0])
+
+    # 创建任务 log 文件
+    task_log_path = None
+    log_interval = config['logging']['log_interval']
+    if log_dir is not None:
+        _meta = dict(run_meta or {})
+        _meta.update({'method': method})
+        _fname = (task_label or method).replace('/', '_').replace(' ', '') + '.log'
+        task_log_path = open_task_log(Path(log_dir), _fname, _meta)
 
     # Training
     for t in range(num_rounds):
@@ -144,7 +171,8 @@ def train_single_run(config, method, device, neighbors=None, progress_queue=None
             model = models[i]
             optimizer = optimizers[i]
 
-            if i in honest_nodes:
+            is_training = (i in honest_nodes) or isinstance(attack, NoAttack)
+            if is_training:
                 model.train()
                 for epoch in range(local_epochs):
                     for data, target in train_loaders[i]:
@@ -169,7 +197,8 @@ def train_single_run(config, method, device, neighbors=None, progress_queue=None
             local_vecs[i] = aggregator.model_to_vector(models[i])
 
         # Post-training attacks
-        if attack and not isinstance(attack, LabelFlippingAttack):
+        no_attack = isinstance(attack, (NoAttack, BrokenNodeAttack))
+        if not no_attack and not isinstance(attack, LabelFlippingAttack):
             honest_vecs = [local_vecs[i] for i in honest_nodes]
             if isinstance(attack, (OmniscientAttack, KrumAttack, TrimAttack)):
                 for byz_id in byzantine_nodes:
@@ -185,7 +214,8 @@ def train_single_run(config, method, device, neighbors=None, progress_queue=None
             own_vec = local_vecs[i]
             neighbor_vecs = all_vecs[neighbors[i]]
 
-            if i in honest_nodes:
+            participates = (i in honest_nodes) or isinstance(attack, NoAttack)
+            if participates:
                 aggregated, agg_stats = aggregator.aggregate(
                     own_vec, neighbor_vecs, t=t, T=num_rounds, return_stats=True
                 )
@@ -201,6 +231,22 @@ def train_single_run(config, method, device, neighbors=None, progress_queue=None
         # 每轮结束向队列报告进度
         if progress_queue is not None and task_label is not None:
             progress_queue.put(f"[{task_label}] round {t+1}/{num_rounds}")
+
+        # 按 log_interval 评估并写 log
+        if task_log_path is not None and (t + 1) % log_interval == 0:
+            honest_vecs_eval = [updated_vecs[i] for i in honest_nodes]
+            eval_mean = torch.stack(honest_vecs_eval).mean(dim=0)
+            eval_model_tmp = SimpleCNN().to(device)
+            aggregator.load_from_vector(eval_model_tmp, eval_mean)
+            eval_model_tmp.eval()
+            c_, n_ = 0, 0
+            with torch.no_grad():
+                for d_, t_ in test_loader:
+                    d_, t_ = d_.to(device, non_blocking=True), t_.to(device, non_blocking=True)
+                    c_ += eval_model_tmp(d_).argmax(dim=1).eq(t_).sum().item()
+                    n_ += t_.size(0)
+            append_task_log(task_log_path, t + 1, num_rounds, 100.0 * c_ / n_)
+            del eval_model_tmp
 
     # Final evaluation on honest mean
     honest_vecs = [updated_vecs[i] for i in honest_nodes]
@@ -220,8 +266,15 @@ def train_single_run(config, method, device, neighbors=None, progress_queue=None
 
     acc = 100.0 * correct / total
 
-    # 释放显存碎片
-    torch.cuda.empty_cache()
+    # 释放显存
+    del train_loaders, test_loader, models, optimizers, aggregator, global_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    elapsed = time.time() - t_start
+    if task_log_path is not None:
+        finalize_task_log(task_log_path, acc, elapsed)
 
     # 完成时通知队列
     if progress_queue is not None and task_label is not None:
@@ -238,11 +291,13 @@ def _progress_printer(queue, total_tasks, stop_event):
             msg = queue.get(timeout=0.2)
         except Exception:
             continue
-        print(msg, flush=True)
         if 'done' in msg:
             done_count += 1
+            print(f"[{done_count}/{total_tasks}] {msg}", flush=True)
             if done_count >= total_tasks:
                 break
+        else:
+            print(msg, flush=True)
 
 
 def _run_parallel_with_progress(submit_fn, tasks, max_workers):
@@ -329,11 +384,35 @@ def run_byzantine_sweep(config_path=None):
 
     max_workers = min(len(tasks), int(os.getenv('TABLE_WORKERS', base_config.get('experiment', {}).get('parallel_workers', 4))))
 
+    from datetime import datetime
+    run_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_log_dir = make_run_log_dir(
+        'byz_sweep',
+        run_ts,
+        base_dir=Path(__file__).parent.parent.parent / 'results',
+    )
+    attack_type = os.getenv('ATTACK_TYPE', base_config['attack']['type'])
+    noniid_alpha = base_config['data']['non_iid_alpha']
+    run_meta_base = {
+        'exp_name'    : 'byz_sweep',
+        'dataset'     : 'mnist',
+        'attack'      : attack_type,
+        'noniid_alpha': str(noniid_alpha),
+        'num_rounds'  : '150',
+        'lr'          : str(base_config['optimizer']['lr']),
+        'batch_size'  : str(base_config['federated']['batch_size']),
+        'topology'    : f"{base_config['topology']['type']}  degree={base_config['topology']['degree']}",
+    }
+    print(f"  Run logs → {run_log_dir}", flush=True)
+
     def submit_fn(executor, task, queue):
         byz_ratio, method, config, label = task
+        meta = dict(run_meta_base)
+        meta['byz_ratio'] = f"{byz_ratio:.2f}"
         return executor.submit(
             train_single_run, config, method, device_str,
-            task_neighbors[byz_ratio], queue, label
+            task_neighbors[byz_ratio], queue, label,
+            str(run_log_dir), meta,
         )
 
     future_to_task, future_results = _run_parallel_with_progress(submit_fn, tasks, max_workers)
@@ -461,11 +540,35 @@ def run_noniid_sweep(config_path=None):
 
     max_workers = min(len(tasks), int(os.getenv('TABLE_WORKERS', base_config.get('experiment', {}).get('parallel_workers', 4))))
 
+    from datetime import datetime
+    run_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_log_dir = make_run_log_dir(
+        'noniid_sweep',
+        run_ts,
+        base_dir=Path(__file__).parent.parent.parent / 'results',
+    )
+    attack_type = os.getenv('ATTACK_TYPE', base_config['attack']['type'])
+    byz_ratio = base_config['federated']['byzantine_ratio']
+    run_meta_base = {
+        'exp_name' : 'noniid_sweep',
+        'dataset'  : 'mnist',
+        'attack'   : attack_type,
+        'byz_ratio': f"{byz_ratio:.2f}",
+        'num_rounds': '150',
+        'lr'       : str(base_config['optimizer']['lr']),
+        'batch_size': str(base_config['federated']['batch_size']),
+        'topology' : f"{base_config['topology']['type']}  degree={base_config['topology']['degree']}",
+    }
+    print(f"  Run logs → {run_log_dir}", flush=True)
+
     def submit_fn(executor, task, queue):
         alpha_val, method, config, label = task
+        meta = dict(run_meta_base)
+        meta['noniid_alpha'] = str(alpha_val)
         return executor.submit(
             train_single_run, config, method, device_str,
-            task_neighbors[alpha_val], queue, label
+            task_neighbors[alpha_val], queue, label,
+            str(run_log_dir), meta,
         )
 
     future_to_task, future_results = _run_parallel_with_progress(submit_fn, tasks, max_workers)

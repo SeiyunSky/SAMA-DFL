@@ -28,27 +28,40 @@ plt.rcParams['font.family'] = 'DejaVu Sans'
 
 from aggregators import SAMAAggregator
 from models import SimpleCNN
-from utils import load_mnist, generate_ring_topology
+from utils import load_mnist, load_mnist_gpu, generate_ring_topology
+from utils import make_run_log_dir, open_task_log, append_task_log, finalize_task_log
 from utils.topology import generate_mesh_topology
-from attacks import GaussianAttack, LabelFlippingAttack, OmniscientAttack, KrumAttack, TrimAttack
+from attacks import (GaussianAttack, LabelFlippingAttack, OmniscientAttack,
+                     KrumAttack, TrimAttack, BrokenNodeAttack, NoAttack)
 from collections import OrderedDict
 
 
-def train_ablation_run(config, aggregator, device):
+def train_ablation_run(config, aggregator, device, task_log=None):
     """Train with a specific aggregator, return final accuracy."""
     num_clients = config['federated']['num_clients']
     byz_ratio = config['federated']['byzantine_ratio']
     num_rounds = config['federated']['num_rounds']
     local_epochs = config['federated']['local_epochs']
     lr = config['optimizer']['lr']
+    log_interval = config['logging']['log_interval']
 
-    train_loaders, test_loader = load_mnist(
-        data_dir=config['data']['data_dir'],
-        num_clients=num_clients,
-        alpha=config['data']['non_iid_alpha'],
-        batch_size=config['federated']['batch_size'],
-        num_workers=config['federated'].get('num_workers', 2)
-    )
+    use_gpu_loader = bool(int(os.getenv('GPU_LOADER', '1')))
+    if use_gpu_loader:
+        train_loaders, test_loader = load_mnist_gpu(
+            data_dir=config['data']['data_dir'],
+            num_clients=num_clients,
+            alpha=config['data']['non_iid_alpha'],
+            batch_size=config['federated']['batch_size'],
+            device=str(device),
+        )
+    else:
+        train_loaders, test_loader = load_mnist(
+            data_dir=config['data']['data_dir'],
+            num_clients=num_clients,
+            alpha=config['data']['non_iid_alpha'],
+            batch_size=config['federated']['batch_size'],
+            num_workers=config['federated'].get('num_workers', 2)
+        )
 
     topology_type = config['topology']['type']
     if topology_type == 'mesh':
@@ -60,15 +73,24 @@ def train_ablation_run(config, aggregator, device):
     honest_nodes = set(range(num_clients - num_byzantine))
     byzantine_nodes = set(range(num_clients - num_byzantine, num_clients))
 
-    attack_type = os.getenv('ATTACK_TYPE', config['attack']['type'])
+    attack_type = os.getenv('ATTACK_TYPE', config['attack']['type']).lower()
+    num_byzantine = int(num_clients * byz_ratio)
     if attack_type == 'gaussian':
         attack = GaussianAttack(std=config['attack']['gaussian_std'])
     elif attack_type == 'label_flipping':
         attack = LabelFlippingAttack(num_classes=10)
     elif attack_type == 'omniscient':
         attack = OmniscientAttack(amplification=config['attack'].get('amplification', 2.0))
+    elif attack_type == 'krum_attack':
+        attack = KrumAttack(num_byzantine=num_byzantine,
+                            amplification=config['attack'].get('amplification', 1.0))
+    elif attack_type == 'trim_attack':
+        attack = TrimAttack(num_byzantine=num_byzantine,
+                            trim_ratio=config['attack'].get('trim_ratio', 0.1))
+    elif attack_type == 'broken_node':
+        attack = BrokenNodeAttack()
     else:
-        attack = None
+        attack = NoAttack()
 
     models = [SimpleCNN().to(device) for _ in range(num_clients)]
     optimizers = [torch.optim.SGD(m.parameters(), lr=lr) for m in models]
@@ -77,7 +99,8 @@ def train_ablation_run(config, aggregator, device):
         local_vecs = [None] * num_clients
         for i in range(num_clients):
             model = models[i]
-            if i in honest_nodes:
+            is_training = (i in honest_nodes) or isinstance(attack, NoAttack)
+            if is_training:
                 model.train()
                 for epoch in range(local_epochs):
                     for data, target in train_loaders[i]:
@@ -100,9 +123,10 @@ def train_ablation_run(config, aggregator, device):
                         loss = torch.nn.functional.cross_entropy(output, target)
                         loss.backward()
                         optimizer.step()
-            local_vecs[i] = aggregator.model_to_vector(models[i])
+        local_vecs[i] = aggregator.model_to_vector(models[i])
 
-        if attack and not isinstance(attack, LabelFlippingAttack):
+        no_attack = isinstance(attack, (NoAttack, BrokenNodeAttack))
+        if not no_attack and not isinstance(attack, LabelFlippingAttack):
             honest_vecs = [local_vecs[i] for i in honest_nodes]
             if isinstance(attack, (OmniscientAttack, KrumAttack, TrimAttack)):
                 for byz_id in byzantine_nodes:
@@ -116,7 +140,8 @@ def train_ablation_run(config, aggregator, device):
         for i in range(num_clients):
             own_vec = local_vecs[i]
             neighbor_vecs = all_vecs[neighbors[i]]
-            if i in honest_nodes:
+            participates = (i in honest_nodes) or isinstance(attack, NoAttack)
+            if participates:
                 aggregated, agg_stats = aggregator.aggregate(
                     own_vec, neighbor_vecs, t=t, T=num_rounds, return_stats=True
                 )
@@ -128,6 +153,22 @@ def train_ablation_run(config, aggregator, device):
 
         for i, vec in enumerate(updated_vecs):
             aggregator.load_from_vector(models[i], vec)
+
+        # 按 log_interval 评估
+        if task_log is not None and (t + 1) % log_interval == 0:
+            honest_vecs_eval = [updated_vecs[i] for i in honest_nodes]
+            eval_mean = torch.stack(honest_vecs_eval).mean(dim=0)
+            _eval_m = SimpleCNN().to(device)
+            aggregator.load_from_vector(_eval_m, eval_mean)
+            _eval_m.eval()
+            c_, n_ = 0, 0
+            with torch.no_grad():
+                for d_, t_ in test_loader:
+                    d_, t_ = d_.to(device, non_blocking=True), t_.to(device, non_blocking=True)
+                    c_ += _eval_m(d_).argmax(dim=1).eq(t_).sum().item()
+                    n_ += t_.size(0)
+            append_task_log(task_log, t + 1, num_rounds, 100.0 * c_ / n_)
+            del _eval_m
 
     # Evaluate
     honest_vecs = [updated_vecs[i] for i in honest_nodes]
@@ -144,7 +185,11 @@ def train_ablation_run(config, aggregator, device):
             correct += pred.eq(target).sum().item()
             total += target.size(0)
 
-    return 100.0 * correct / total
+    acc = 100.0 * correct / total
+    del train_loaders, test_loader, models, optimizers, global_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return acc
 
 
 class NoAlignAggregator(SAMAAggregator):
@@ -356,11 +401,47 @@ def run_ablation_study(config_path=None):
     }
 
     results = {}
+    attack_type = os.getenv('ATTACK_TYPE', config['attack']['type'])
+    byz_ratio = config['federated']['byzantine_ratio']
+    noniid_alpha = config['data']['non_iid_alpha']
+
+    from datetime import datetime
+    run_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    from pathlib import Path
+    run_log_dir = make_run_log_dir(
+        'ablation',
+        run_ts,
+        base_dir=Path(__file__).parent.parent.parent / 'results',
+    )
+    run_meta_base = {
+        'exp_name'    : 'ablation_study',
+        'dataset'     : 'mnist',
+        'attack'      : attack_type,
+        'byz_ratio'   : f"{byz_ratio:.2f}",
+        'noniid_alpha': str(noniid_alpha),
+        'num_clients' : str(config['federated']['num_clients']),
+        'num_rounds'  : str(config['federated']['num_rounds']),
+        'lr'          : str(config['optimizer']['lr']),
+        'batch_size'  : str(config['federated']['batch_size']),
+    }
+    print(f"  Run logs → {run_log_dir}", flush=True)
+
+    import time
     for name, aggregator in variants.items():
         print(f"\n  Running: {name}...")
-        acc = train_ablation_run(config, aggregator, device)
+        t0 = time.time()
+        _meta = dict(run_meta_base)
+        _meta['variant'] = name
+        task_log = open_task_log(
+            run_log_dir,
+            name.lower().replace(' ', '_') + '.log',
+            _meta,
+        )
+        acc = train_ablation_run(config, aggregator, device, task_log=task_log)
+        elapsed = time.time() - t0
+        finalize_task_log(task_log, acc, elapsed)
         results[name] = acc
-        print(f"  -> Accuracy: {acc:.2f}%")
+        print(f"  -> Accuracy: {acc:.2f}%  ({elapsed:.1f}s)")
 
     # Plot
     fig, ax = plt.subplots(figsize=(10, 6))

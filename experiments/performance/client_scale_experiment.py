@@ -25,13 +25,16 @@ from aggregators import (SAMAAggregator, BALANCEAggregator, SCCLIPAggregator,
                          FedAvgAggregator, KrumAggregator, TrimmedMeanAggregator,
                          CoordMedianAggregator)
 from models import SimpleCNN
-from utils import load_mnist
+from utils import load_mnist, load_mnist_gpu
+from utils import make_run_log_dir, open_task_log, append_task_log, finalize_task_log
 from utils.topology import generate_mesh_topology
-from attacks import GaussianAttack, LabelFlippingAttack, OmniscientAttack, KrumAttack, TrimAttack
+from attacks import (GaussianAttack, LabelFlippingAttack, OmniscientAttack,
+                     KrumAttack, TrimAttack, BrokenNodeAttack, NoAttack)
 
 
 def _build_attack(attack_key, num_byzantine, config):
     atk = config['attack']
+    attack_key = attack_key.lower()   # 统一小写，防止环境变量大小写不一致
     if attack_key == 'none':
         from attacks import NoAttack
         return NoAttack()
@@ -47,6 +50,11 @@ def _build_attack(attack_key, num_byzantine, config):
     elif attack_key == 'trim_attack':
         return TrimAttack(num_byzantine=num_byzantine,
                           trim_ratio=atk.get('trim_ratio', 0.1))
+    elif attack_key == 'broken_node':
+        return BrokenNodeAttack()
+    elif attack_key == 'none':
+        from attacks import NoAttack
+        return NoAttack()
     else:
         raise ValueError(f"Unknown attack: {attack_key}")
 
@@ -94,8 +102,11 @@ def _create_aggregator(method, config, model_template=None):
         raise ValueError(f"Unknown method: {method}")
 
 
-def _train_one(config, method, device, neighbors=None, progress_queue=None, task_label=None):
+def _train_one(config, method, device, neighbors=None, progress_queue=None,
+               task_label=None, log_dir=None, run_meta=None):
     """单次训练，返回 final test accuracy (%)"""
+    import time
+    t_start = time.time()
     num_clients = config['federated']['num_clients']
     byz_ratio = config['federated']['byzantine_ratio']
     num_rounds = config['federated']['num_rounds']
@@ -103,13 +114,23 @@ def _train_one(config, method, device, neighbors=None, progress_queue=None, task
     lr = config['optimizer']['lr']
     mesh_degree = config['topology']['degree']
 
-    train_loaders, test_loader = load_mnist(
-        data_dir=config['data']['data_dir'],
-        num_clients=num_clients,
-        alpha=config['data']['non_iid_alpha'],
-        batch_size=config['federated']['batch_size'],
-        num_workers=config['federated'].get('num_workers', 2),
-    )
+    use_gpu_loader = bool(int(os.getenv('GPU_LOADER', '1')))
+    if use_gpu_loader:
+        train_loaders, test_loader = load_mnist_gpu(
+            data_dir=config['data']['data_dir'],
+            num_clients=num_clients,
+            alpha=config['data']['non_iid_alpha'],
+            batch_size=config['federated']['batch_size'],
+            device=str(device),
+        )
+    else:
+        train_loaders, test_loader = load_mnist(
+            data_dir=config['data']['data_dir'],
+            num_clients=num_clients,
+            alpha=config['data']['non_iid_alpha'],
+            batch_size=config['federated']['batch_size'],
+            num_workers=config['federated'].get('num_workers', 2),
+        )
 
     if neighbors is None:
         # Mesh degree 不能超过 num_clients - 1
@@ -127,12 +148,22 @@ def _train_one(config, method, device, neighbors=None, progress_queue=None, task
     optimizers = [torch.optim.SGD(m.parameters(), lr=lr) for m in models]
     aggregator = _create_aggregator(method, config, model_template=models[0])
 
+    # 创建任务 log 文件
+    task_log_path = None
+    log_interval = config['logging']['log_interval']
+    if log_dir is not None:
+        _meta = dict(run_meta or {})
+        _meta.update({'method': method, 'num_clients': str(num_clients)})
+        _fname = (task_label or f"{method}_n{num_clients}").replace('/', '_').replace(' ', '') + '.log'
+        task_log_path = open_task_log(Path(log_dir), _fname, _meta)
+
     for t in range(num_rounds):
         local_vecs = [None] * num_clients
         for i in range(num_clients):
             model = models[i]
             optimizer = optimizers[i]
-            if i in honest_nodes:
+            is_training = (i in honest_nodes) or isinstance(attack, NoAttack)
+            if is_training:
                 model.train()
                 for _ in range(local_epochs):
                     for data, target in train_loaders[i]:
@@ -155,7 +186,8 @@ def _train_one(config, method, device, neighbors=None, progress_queue=None, task
                         optimizer.step()
             local_vecs[i] = aggregator.model_to_vector(models[i])
 
-        if not isinstance(attack, LabelFlippingAttack):
+        no_attack = isinstance(attack, (NoAttack, BrokenNodeAttack))
+        if not no_attack and not isinstance(attack, LabelFlippingAttack):
             honest_vecs = [local_vecs[i] for i in honest_nodes]
             if isinstance(attack, (OmniscientAttack, KrumAttack, TrimAttack)):
                 for byz_id in byzantine_nodes:
@@ -169,7 +201,8 @@ def _train_one(config, method, device, neighbors=None, progress_queue=None, task
         for i in range(num_clients):
             own_vec = local_vecs[i]
             neighbor_vecs = all_vecs[neighbors[i]]
-            if i in honest_nodes:
+            participates = (i in honest_nodes) or isinstance(attack, NoAttack)
+            if participates:
                 aggregated, agg_stats = aggregator.aggregate(
                     own_vec, neighbor_vecs, t=t, T=num_rounds, return_stats=True
                 )
@@ -186,6 +219,22 @@ def _train_one(config, method, device, neighbors=None, progress_queue=None, task
         if progress_queue is not None and task_label is not None:
             progress_queue.put(f"[{task_label}] round {t+1}/{num_rounds}")
 
+        # 按 log_interval 评估并写 log
+        if task_log_path is not None and (t + 1) % log_interval == 0:
+            eval_vecs = [updated_vecs[i] for i in honest_nodes]
+            eval_mean = torch.stack(eval_vecs).mean(dim=0)
+            _em = SimpleCNN().to(device)
+            aggregator.load_from_vector(_em, eval_mean)
+            _em.eval()
+            c_, n_ = 0, 0
+            with torch.no_grad():
+                for d_, t_ in test_loader:
+                    d_, t_ = d_.to(device, non_blocking=True), t_.to(device, non_blocking=True)
+                    c_ += _em(d_).argmax(dim=1).eq(t_).sum().item()
+                    n_ += t_.size(0)
+            append_task_log(task_log_path, t + 1, num_rounds, 100.0 * c_ / n_)
+            del _em
+
     honest_vecs = [updated_vecs[i] for i in honest_nodes]
     honest_mean = torch.stack(honest_vecs).mean(dim=0)
     global_model = SimpleCNN().to(device)
@@ -201,9 +250,15 @@ def _train_one(config, method, device, neighbors=None, progress_queue=None, task
             total += target.size(0)
 
     acc = 100.0 * correct / total
+    elapsed = time.time() - t_start
 
-    # 释放显存碎片
-    torch.cuda.empty_cache()
+    if task_log_path is not None:
+        finalize_task_log(task_log_path, acc, elapsed)
+
+    del train_loaders, test_loader, models, optimizers, aggregator, global_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
     # 完成时通知队列
     if progress_queue is not None and task_label is not None:
@@ -220,11 +275,13 @@ def _progress_printer(queue, total_tasks, stop_event):
             msg = queue.get(timeout=0.2)
         except Exception:
             continue
-        print(msg, flush=True)
         if 'done' in msg:
             done_count += 1
+            print(f"[{done_count}/{total_tasks}] {msg}", flush=True)
             if done_count >= total_tasks:
                 break
+        else:
+            print(msg, flush=True)
 
 
 def run_client_scale_experiment(config_path=None):
@@ -280,6 +337,26 @@ def run_client_scale_experiment(config_path=None):
     max_workers = min(len(tasks), int(os.getenv('TABLE_WORKERS', 4)))
     print(f"\n  Running {len(tasks)} tasks with {max_workers} workers in parallel...")
 
+    from datetime import datetime
+    run_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_log_dir = make_run_log_dir(
+        'client_scale',
+        run_ts,
+        base_dir=Path(__file__).parent.parent.parent / 'results',
+    )
+    run_meta_base = {
+        'exp_name'    : 'client_scale',
+        'dataset'     : 'mnist',
+        'attack'      : attack_key,
+        'byz_ratio'   : f"{byz_ratio:.2f}",
+        'noniid_alpha': str(noniid_alpha),
+        'num_rounds'  : str(base_config['federated']['num_rounds']),
+        'lr'          : str(base_config['optimizer']['lr']),
+        'batch_size'  : str(base_config['federated']['batch_size']),
+        'topology'    : f"mesh  degree={base_config['topology']['degree']}",
+    }
+    print(f"  Run logs → {run_log_dir}", flush=True)
+
     mgr = multiprocessing.Manager()
     progress_queue = mgr.Queue()
     stop_event = threading.Event()
@@ -292,11 +369,14 @@ def run_client_scale_experiment(config_path=None):
     printer.start()
 
     task_results = {}
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+    mp_context = multiprocessing.get_context('spawn')
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers,
+                                                mp_context=mp_context) as executor:
         future_to_key = {
             executor.submit(
-                _train_one, config, method, device,
-                task_neighbors[n], progress_queue, label
+                _train_one, config, method, str(device),
+                task_neighbors[n], progress_queue, label,
+                str(run_log_dir), {**run_meta_base, 'num_clients': str(n)},
             ): (n, method)
             for n, method, config, label in tasks
         }

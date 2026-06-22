@@ -38,6 +38,7 @@ from aggregators import (SAMAAggregator, BALANCEAggregator, SCCLIPAggregator,
                          CoordMedianAggregator)
 from models import SimpleCNN
 from utils import load_mnist, load_cifar10, load_mnist_gpu, load_cifar10_gpu
+from utils import make_run_log_dir, open_task_log, append_task_log, finalize_task_log
 from utils.topology import generate_mesh_topology
 from attacks import (NoAttack, GaussianAttack, LabelFlippingAttack,
                      OmniscientAttack, KrumAttack, TrimAttack, BrokenNodeAttack)
@@ -129,16 +130,18 @@ def _create_aggregator(method, config, model_template=None):
 
 
 def _train_one(config, method, attack_key, device, dataset='mnist', neighbors=None,
-               progress_queue=None, task_label=None, log_file=None):
+               progress_queue=None, task_label=None, log_dir=None, run_meta=None):
     """单次训练，返回 (最终accuracy, accuracy历史列表)"""
+    import time
+    t_start = time.time()
     num_clients = config['federated']['num_clients']
     byz_ratio = config['federated']['byzantine_ratio']
     num_rounds = config['federated']['num_rounds']
     local_epochs = config['federated']['local_epochs']
     lr = config['optimizer']['lr']
+    log_interval = config['logging']['log_interval']
     momentum = config['optimizer'].get('momentum', 0.0)
     weight_decay = config['optimizer'].get('weight_decay', 0.0)
-    log_interval = config['logging']['log_interval']
 
     num_workers = config['federated'].get('num_workers', 2)
     use_gpu_loader = bool(int(os.getenv('GPU_LOADER', '1')))  # 默认开
@@ -195,6 +198,18 @@ def _train_one(config, method, attack_key, device, dataset='mnist', neighbors=No
     optimizers = [torch.optim.SGD(m.parameters(), lr=lr, momentum=momentum,
                                   weight_decay=weight_decay) for m in models]
     acc_history = []
+
+    # 创建任务 log 文件
+    task_log_path = None
+    if log_dir is not None:
+        _meta = dict(run_meta or {})
+        _meta.update({'method': method, 'attack': attack_key})
+        _param_str = task_label.replace('/', '_').replace(' ', '') if task_label else f"{method}_{attack_key}"
+        task_log_path = open_task_log(
+            Path(log_dir),
+            f"{_param_str}.log",
+            _meta,
+        )
 
     for t in range(num_rounds):
         local_vecs = [None] * num_clients
@@ -275,11 +290,14 @@ def _train_one(config, method, attack_key, device, dataset='mnist', neighbors=No
                     correct += pred.eq(target).sum().item()
                     total += target.size(0)
             acc_history.append(100.0 * correct / total)
-            if log_file is not None:
-                with open(log_file, 'a') as f:
-                    f.write(f"round={t+1}/{num_rounds} acc={acc_history[-1]:.2f}%\n")
+            if task_log_path is not None:
+                append_task_log(task_log_path, t + 1, num_rounds, acc_history[-1])
 
     final_acc = acc_history[-1] if acc_history else 0.0
+    elapsed = time.time() - t_start
+
+    if task_log_path is not None:
+        finalize_task_log(task_log_path, final_acc, elapsed)
 
     # 显式释放 GPU 显存：dataloader（含预加载的 tensor）、模型、优化器
     del train_loaders, test_loader
@@ -291,7 +309,7 @@ def _train_one(config, method, attack_key, device, dataset='mnist', neighbors=No
 
 def _worker(args):
     """顶层 worker，可被 ProcessPoolExecutor pickle。"""
-    m_idx, a_idx, config, method, attack_key, device_str, dataset, neighbors, progress_queue = args
+    m_idx, a_idx, config, method, attack_key, device_str, dataset, neighbors, progress_queue, run_log_dir, run_meta = args
     # 子进程里固定 per-task seed，保证每个 (method, attack) 可复现
     seed = config.get('experiment', {}).get('seed', 42)
     torch.manual_seed(seed + m_idx * 100 + a_idx)
@@ -301,14 +319,10 @@ def _worker(args):
     device = torch.device(device_str)
     task_label = f"{method.upper()}/{attack_key}"
 
-    log_dir = Path(__file__).parent.parent.parent / 'results' / 'logs'
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / f"{dataset}_{method}_{attack_key}.log"
-
     acc, history = _train_one(config, method, attack_key, device,
                               dataset=dataset, neighbors=neighbors,
                               progress_queue=progress_queue, task_label=task_label,
-                              log_file=log_file)
+                              log_dir=run_log_dir, run_meta=run_meta)
     # 子进程退出前再清一遍，确保 spawn 进程释放干净
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -373,23 +387,51 @@ def _run_table(base_config, dataset_name, save_dir):
     mgr = multiprocessing.Manager()
     progress_queue = mgr.Queue()
 
+    # 创建本次运行的 log 目录（主进程统一时间戳，子进程复用）
+    from datetime import datetime
+    run_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_log_dir = make_run_log_dir(
+        f"{dataset_name}_table",
+        run_ts,
+        base_dir=Path(__file__).parent.parent.parent / 'results',
+    )
+    run_meta = {
+        'exp_name'    : f"{dataset_name}_multi_attack_table",
+        'dataset'     : dataset_name,
+        'byz_ratio'   : f"{byz_ratio:.2f}",
+        'noniid_alpha': str(noniid_alpha),
+        'num_clients' : str(num_clients),
+        'num_rounds'  : str(num_rounds),
+        'lr'          : str(base_config['optimizer']['lr']),
+        'batch_size'  : str(base_config['federated']['batch_size']),
+        'topology'    : f"{base_config['topology']['type']}  degree={base_config['topology']['degree']}",
+        'log_interval': str(log_interval),
+    }
+    print(f"  Run logs → {run_log_dir}", flush=True)
+
     tasks = []
     for a_idx, attack_key in enumerate(active_attack_keys):
         for m_idx, method in enumerate(active_method_keys):
             config = copy.deepcopy(base_config)
             tasks.append((m_idx, a_idx, config, method, attack_key,
-                          device_str, dataset_name, shared_neighbors, progress_queue))
+                          device_str, dataset_name, shared_neighbors, progress_queue,
+                          str(run_log_dir), run_meta))
 
     total = len(tasks)
     pbar = tqdm(total=total, desc=f"Running {dataset_name.upper()} table")
 
     # 监听线程：把孙进程的进度消息打到 stdout
+    done_count = [0]
     stop_event = threading.Event()
     def _printer():
         while not stop_event.is_set() or not progress_queue.empty():
             try:
                 msg = progress_queue.get(timeout=0.2)
-                print(msg, flush=True)
+                if 'done' in msg:
+                    done_count[0] += 1
+                    print(f"[{done_count[0]}/{total}] {msg}", flush=True)
+                else:
+                    print(msg, flush=True)
             except Exception:
                 pass
     printer = threading.Thread(target=_printer, daemon=True)

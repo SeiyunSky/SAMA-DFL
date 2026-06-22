@@ -9,6 +9,66 @@ import sys
 import numpy as np
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 轻量任务 log：每个 (method, attack, param) 任务一个文件，带完整头信息
+# 适合在 spawn 子进程中直接 open/write，无需 logging 模块
+# ──────────────────────────────────────────────────────────────────────────────
+
+def make_run_log_dir(exp_name: str, run_timestamp: str, base_dir: str = None) -> Path:
+    """
+    返回本次实验运行的 log 目录（已创建）。
+    路径：{base_dir}/logs/{run_timestamp}_{exp_name}/
+    run_timestamp 由调用方统一生成（主进程），子进程复用，保证同一次运行落同一文件夹。
+    """
+    if base_dir is None:
+        base_dir = Path(__file__).parent.parent / 'results'
+    log_dir = Path(base_dir) / 'logs' / f"{run_timestamp}_{exp_name}"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir
+
+
+def open_task_log(log_dir: Path, filename: str, meta: dict) -> Path:
+    """
+    创建单个任务的 log 文件，写入结构化头信息，返回文件路径。
+
+    meta 字段（全部可选，建议包含）：
+        exp_name, method, attack, 以及实验特有参数（byz_ratio / noniid_alpha / n_clients 等）、
+        num_rounds, lr, batch_size, num_clients, topology 等
+
+    调用方后续用 append_task_log() 按轮写入 acc。
+    """
+    log_path = log_dir / filename
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    with open(log_path, 'w', encoding='utf-8') as f:
+        f.write("# " + "=" * 62 + "\n")
+        f.write(f"# Experiment  : {meta.get('exp_name', 'unknown')}\n")
+        f.write(f"# Started at  : {now}\n")
+        f.write("# " + "-" * 62 + "\n")
+        for key, val in meta.items():
+            if key == 'exp_name':
+                continue
+            f.write(f"# {key:<14}: {val}\n")
+        f.write("# " + "=" * 62 + "\n")
+    return log_path
+
+
+def append_task_log(log_path: Path, round_num: int, num_rounds: int, acc: float):
+    """向任务 log 文件追加一行：round=X/Y  acc=ZZ.ZZ%"""
+    with open(log_path, 'a', encoding='utf-8') as f:
+        f.write(f"round={round_num}/{num_rounds}  acc={acc:.2f}%\n")
+
+
+def finalize_task_log(log_path: Path, final_acc: float, elapsed_sec: float = None):
+    """在任务 log 末尾写最终结果行。"""
+    with open(log_path, 'a', encoding='utf-8') as f:
+        f.write("# " + "-" * 62 + "\n")
+        f.write(f"# final_acc   : {final_acc:.2f}%\n")
+        if elapsed_sec is not None:
+            f.write(f"# elapsed     : {elapsed_sec:.1f}s\n")
+        f.write("# " + "=" * 62 + "\n")
+
+
+
 class ExperimentLogger:
     """实验日志记录器"""
 
