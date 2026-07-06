@@ -41,7 +41,7 @@ from utils import load_mnist, load_cifar10, load_mnist_gpu, load_cifar10_gpu
 from utils import make_run_log_dir, open_task_log, append_task_log, finalize_task_log
 from utils.topology import generate_mesh_topology
 from attacks import (NoAttack, GaussianAttack, LabelFlippingAttack,
-                     OmniscientAttack, KrumAttack, TrimAttack, BrokenNodeAttack)
+                     OmniscientAttack, ALIEAttack, KrumAttack, TrimAttack, BrokenNodeAttack)
 
 
 def _build_attack(key, num_byzantine, config):
@@ -54,6 +54,9 @@ def _build_attack(key, num_byzantine, config):
         return LabelFlippingAttack(num_classes=10)
     elif key == 'omniscient':
         return OmniscientAttack(amplification=atk.get('amplification', 2.0))
+    elif key == 'alie':
+        return ALIEAttack(num_byzantine=num_byzantine,
+                          num_clients=config['federated']['num_clients'])
     elif key == 'krum_attack':
         return KrumAttack(num_byzantine=num_byzantine,
                           amplification=atk.get('amplification', 1.0))
@@ -66,8 +69,8 @@ def _build_attack(key, num_byzantine, config):
         raise ValueError(f"Unknown attack: {key}")
 
 
-ATTACK_KEYS = ['none', 'gaussian', 'label_flipping', 'omniscient', 'krum_attack', 'trim_attack', 'broken_node']
-ATTACK_LABELS = ['No Attack', 'Gaussian', 'Label Flip', 'Omniscient', 'Krum Atk', 'Trim Atk', 'Broken Node']
+ATTACK_KEYS = ['none', 'gaussian', 'label_flipping', 'omniscient', 'alie', 'krum_attack', 'trim_attack', 'broken_node']
+ATTACK_LABELS = ['No Attack', 'Gaussian', 'Label Flip', 'Omniscient', 'ALIE', 'Krum Atk', 'Trim Atk', 'Broken Node']
 
 METHOD_KEYS = ['sama', 'balance', 'scclip', 'fedavg', 'krum', 'multi_krum', 'trimmed_mean', 'coord_median']
 METHOD_LABELS = ['SAMA', 'BALANCE', 'SC-CLIP', 'FedAvg', 'Krum', 'Multi-Krum', 'Trim-Mean', 'CoordMed']
@@ -79,9 +82,9 @@ METHOD_COLORS = [
 METHOD_LINESTYLES = ['-', '-', '-', '--', '--', '--', '-.', '-.']
 
 ATTACK_COLORS = [
-    '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#17becf',
+    '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#e377c2', '#9467bd', '#8c564b', '#17becf',
 ]
-ATTACK_LINESTYLES = ['-', '--', '-.', ':', '-', '--', '-.']
+ATTACK_LINESTYLES = ['-', '--', '-.', ':', '-', '--', '-.', ':']
 
 
 def _create_aggregator(method, config, model_template=None):
@@ -243,7 +246,7 @@ def _train_one(config, method, attack_key, device, dataset='mnist', neighbors=No
 
         if not isinstance(attack, (NoAttack, LabelFlippingAttack, BrokenNodeAttack)):
             honest_vecs = [local_vecs[i] for i in honest_nodes]
-            if isinstance(attack, (OmniscientAttack, KrumAttack, TrimAttack)):
+            if isinstance(attack, (OmniscientAttack, ALIEAttack, KrumAttack, TrimAttack)):
                 for byz_id in byzantine_nodes:
                     local_vecs[byz_id] = attack.attack(honest_vecs)
             else:
@@ -379,236 +382,258 @@ def _run_table(base_config, dataset_name, save_dir):
         active_method_colors = METHOD_COLORS
         active_method_linestyles = METHOD_LINESTYLES
 
-    results = np.zeros((len(active_method_keys), len(active_attack_keys)))
-    histories = [[None] * len(active_attack_keys) for _ in range(len(active_method_keys))]
-
+    num_runs = int(os.getenv('TABLE_NUM_RUNS', '1'))
     max_workers = int(os.getenv('TABLE_WORKERS', base_config.get('experiment', {}).get('parallel_workers', 4)))
 
-    mgr = multiprocessing.Manager()
-    progress_queue = mgr.Queue()
-
-    # 创建本次运行的 log 目录（主进程统一时间戳，子进程复用）
     from datetime import datetime
-    run_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    run_log_dir = make_run_log_dir(
-        f"{dataset_name}_table",
-        run_ts,
-        base_dir=Path(__file__).parent.parent.parent / 'results',
-    )
-    run_meta = {
-        'exp_name'    : f"{dataset_name}_multi_attack_table",
-        'dataset'     : dataset_name,
-        'byz_ratio'   : f"{byz_ratio:.2f}",
-        'noniid_alpha': str(noniid_alpha),
-        'num_clients' : str(num_clients),
-        'num_rounds'  : str(num_rounds),
-        'lr'          : str(base_config['optimizer']['lr']),
-        'batch_size'  : str(base_config['federated']['batch_size']),
-        'topology'    : f"{base_config['topology']['type']}  degree={base_config['topology']['degree']}",
-        'log_interval': str(log_interval),
-    }
-    print(f"  Run logs → {run_log_dir}", flush=True)
-
-    tasks = []
-    for a_idx, attack_key in enumerate(active_attack_keys):
-        for m_idx, method in enumerate(active_method_keys):
-            config = copy.deepcopy(base_config)
-            tasks.append((m_idx, a_idx, config, method, attack_key,
-                          device_str, dataset_name, shared_neighbors, progress_queue,
-                          str(run_log_dir), run_meta))
-
-    total = len(tasks)
-    pbar = tqdm(total=total, desc=f"Running {dataset_name.upper()} table")
-
-    # 监听线程：把孙进程的进度消息打到 stdout
-    done_count = [0]
-    stop_event = threading.Event()
-    def _printer():
-        while not stop_event.is_set() or not progress_queue.empty():
-            try:
-                msg = progress_queue.get(timeout=0.2)
-                if 'done' in msg:
-                    done_count[0] += 1
-                    print(f"[{done_count[0]}/{total}] {msg}", flush=True)
-                else:
-                    print(msg, flush=True)
-            except Exception:
-                pass
-    printer = threading.Thread(target=_printer, daemon=True)
-    printer.start()
-
-    with ProcessPoolExecutor(max_workers=max_workers,
-                             mp_context=multiprocessing.get_context('spawn')) as executor:
-        futures = {executor.submit(_worker, t): t for t in tasks}
-        for future in as_completed(futures):
-            m_idx, a_idx, acc, history = future.result()
-            results[m_idx, a_idx] = acc
-            histories[m_idx][a_idx] = history
-            method = active_method_keys[m_idx]
-            attack = active_attack_keys[a_idx]
-            done = int(pbar.n) + 1
-            print(f"[{done}/{total}] {method.upper()} vs {attack} -> {acc:.2f}%", flush=True)
-            pbar.set_postfix({'method': method, 'attack': attack, 'acc': f'{acc:.1f}%'})
-            pbar.update(1)
-
-    stop_event.set()
-    printer.join(timeout=2)
-    pbar.close()
+    batch_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    batch_dir = Path(__file__).parent.parent.parent / 'results' / f"{dataset_name}_table_{batch_ts}"
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Batch dir → {batch_dir}", flush=True)
 
     tag = f"{dataset_name}_byz{int(byz_ratio*100)}_alpha{noniid_alpha}"
     ds_upper = dataset_name.upper()
-
-    # ── 热力图 ──────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(12, 7))
-    im = ax.imshow(results, cmap='RdYlGn', vmin=0, vmax=100, aspect='auto')
-    plt.colorbar(im, ax=ax, label='Test Accuracy (%)')
-    ax.set_xticks(range(len(active_attack_keys)))
-    ax.set_xticklabels(active_attack_labels, fontsize=11)
-    ax.set_yticks(range(len(active_method_keys)))
-    ax.set_yticklabels(active_method_labels, fontsize=11)
-    ax.set_xlabel('Attack Type', fontsize=12)
-    ax.set_ylabel('Aggregation Method', fontsize=12)
-    ax.set_title(
-        f'{ds_upper}: Accuracy (%) by Method × Attack\n'
-        f'Byzantine={byz_ratio:.0%}, Dirichlet α={noniid_alpha}, Mesh degree=6',
-        fontsize=12, fontweight='bold'
-    )
-    for m_idx in range(len(active_method_keys)):
-        for a_idx in range(len(active_attack_keys)):
-            val = results[m_idx, a_idx]
-            color = 'black' if 30 < val < 80 else 'white'
-            ax.text(a_idx, m_idx, f'{val:.1f}', ha='center', va='center',
-                    fontsize=9, color=color, fontweight='bold')
-    plt.tight_layout()
-    fig_path = save_dir / f'heatmap_{tag}.png'
-    plt.savefig(fig_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"Heatmap saved: {fig_path.name}")
-
-    # ── per-attack 折线图（6张，每张8条方法曲线）──────────────
     round_ticks = list(range(log_interval, num_rounds + 1, log_interval))
-    for a_idx, (attack_key, attack_label) in enumerate(zip(active_attack_keys, active_attack_labels)):
-        fig, ax = plt.subplots(figsize=(8, 5))
-        for m_idx, (method_label, color, ls) in enumerate(
-                zip(active_method_labels, active_method_colors, active_method_linestyles)):
-            hist = histories[m_idx][a_idx]
-            if hist:
-                ax.plot(round_ticks[:len(hist)], hist,
-                        label=method_label, color=color, linestyle=ls,
-                        linewidth=1.8, marker='o', markersize=3)
-        ax.set_xlabel('Communication Round', fontsize=12)
-        ax.set_ylabel('Test Accuracy (%)', fontsize=12)
+
+    all_final_acc = []  # list of (n_methods, n_attacks) arrays, one per run
+
+    for run_idx in range(num_runs):
+        run_seed = seed + run_idx * 10000
+        torch.manual_seed(run_seed)
+        np.random.seed(run_seed)
+
+        run_dir = batch_dir / f"run_{run_idx}"
+        run_dir.mkdir(exist_ok=True)
+        print(f"\n{'='*60}", flush=True)
+        print(f"Run {run_idx}/{num_runs-1}  seed={run_seed}  → {run_dir.name}", flush=True)
+        print(f"{'='*60}", flush=True)
+
+        results = np.zeros((len(active_method_keys), len(active_attack_keys)))
+        histories = [[None] * len(active_attack_keys) for _ in range(len(active_method_keys))]
+
+        run_meta = {
+            'exp_name'    : f"{dataset_name}_multi_attack_table",
+            'dataset'     : dataset_name,
+            'run_idx'     : str(run_idx),
+            'num_runs'    : str(num_runs),
+            'seed'        : str(run_seed),
+            'byz_ratio'   : f"{byz_ratio:.2f}",
+            'noniid_alpha': str(noniid_alpha),
+            'num_clients' : str(num_clients),
+            'num_rounds'  : str(num_rounds),
+            'lr'          : str(base_config['optimizer']['lr']),
+            'batch_size'  : str(base_config['federated']['batch_size']),
+            'topology'    : f"{base_config['topology']['type']}  degree={base_config['topology']['degree']}",
+            'log_interval': str(log_interval),
+        }
+
+        mgr = multiprocessing.Manager()
+        progress_queue = mgr.Queue()
+
+        tasks = []
+        for a_idx, attack_key in enumerate(active_attack_keys):
+            for m_idx, method in enumerate(active_method_keys):
+                config = copy.deepcopy(base_config)
+                # 每个 worker 的 seed 在 run_seed 基础上再偏移
+                if 'experiment' not in config:
+                    config['experiment'] = {}
+                config['experiment']['seed'] = run_seed
+                tasks.append((m_idx, a_idx, config, method, attack_key,
+                              device_str, dataset_name, shared_neighbors, progress_queue,
+                              str(run_dir), run_meta))
+
+        total = len(tasks)
+        pbar = tqdm(total=total, desc=f"Run {run_idx}/{num_runs-1} {dataset_name.upper()}")
+
+        done_count = [0]
+        stop_event = threading.Event()
+        def _printer():
+            while not stop_event.is_set() or not progress_queue.empty():
+                try:
+                    msg = progress_queue.get(timeout=0.2)
+                    if 'done' in msg:
+                        done_count[0] += 1
+                        print(f"[{done_count[0]}/{total}] {msg}", flush=True)
+                    else:
+                        print(msg, flush=True)
+                except Exception:
+                    pass
+        printer = threading.Thread(target=_printer, daemon=True)
+        printer.start()
+
+        with ProcessPoolExecutor(max_workers=max_workers,
+                                 mp_context=multiprocessing.get_context('spawn')) as executor:
+            futures = {executor.submit(_worker, t): t for t in tasks}
+            for future in as_completed(futures):
+                m_idx, a_idx, acc, history = future.result()
+                results[m_idx, a_idx] = acc
+                histories[m_idx][a_idx] = history
+                method = active_method_keys[m_idx]
+                attack = active_attack_keys[a_idx]
+                done = int(pbar.n) + 1
+                print(f"[{done}/{total}] {method.upper()} vs {attack} -> {acc:.2f}%", flush=True)
+                pbar.set_postfix({'method': method, 'attack': attack, 'acc': f'{acc:.1f}%'})
+                pbar.update(1)
+
+        stop_event.set()
+        printer.join(timeout=2)
+        pbar.close()
+
+        all_final_acc.append(results.copy())
+
+        # ── 热力图（本 run）──────────────────────────────────
+        fig, ax = plt.subplots(figsize=(12, 7))
+        im = ax.imshow(results, cmap='RdYlGn', vmin=0, vmax=100, aspect='auto')
+        plt.colorbar(im, ax=ax, label='Test Accuracy (%)')
+        ax.set_xticks(range(len(active_attack_keys)))
+        ax.set_xticklabels(active_attack_labels, fontsize=11)
+        ax.set_yticks(range(len(active_method_keys)))
+        ax.set_yticklabels(active_method_labels, fontsize=11)
+        ax.set_xlabel('Attack Type', fontsize=12)
+        ax.set_ylabel('Aggregation Method', fontsize=12)
         ax.set_title(
-            f'{ds_upper} — {attack_label}\n'
-            f'Byzantine={byz_ratio:.0%}, Dirichlet α={noniid_alpha}, Mesh d=6',
+            f'{ds_upper}: Accuracy (%) by Method × Attack  [run {run_idx}]\n'
+            f'Byzantine={byz_ratio:.0%}, Dirichlet α={noniid_alpha}, Mesh degree=6',
             fontsize=12, fontweight='bold'
         )
-        ax.set_ylim(0, 100)
-        ax.legend(fontsize=9, ncol=2, loc='lower right')
-        ax.grid(True, alpha=0.3)
+        for m_idx in range(len(active_method_keys)):
+            for a_idx in range(len(active_attack_keys)):
+                val = results[m_idx, a_idx]
+                color = 'black' if 30 < val < 80 else 'white'
+                ax.text(a_idx, m_idx, f'{val:.1f}', ha='center', va='center',
+                        fontsize=9, color=color, fontweight='bold')
         plt.tight_layout()
-        curve_path = save_dir / f'acc_per_attack_{attack_key}_{tag}.png'
-        plt.savefig(curve_path, dpi=300, bbox_inches='tight')
+        plt.savefig(run_dir / f'heatmap_{tag}.png', dpi=300, bbox_inches='tight')
         plt.close()
-        print(f"Per-attack curve saved: {curve_path.name}")
 
-    # ── per-method 折线图（8张，每张6条攻击曲线）──────────────
-    for m_idx, (method_key, method_label) in enumerate(zip(active_method_keys, active_method_labels)):
-        fig, ax = plt.subplots(figsize=(8, 5))
-        for a_idx, (attack_label, color, ls) in enumerate(
-                zip(active_attack_labels,
-                    [ATTACK_COLORS[i] for i in attack_indices],
-                    [ATTACK_LINESTYLES[i] for i in attack_indices])):
-            hist = histories[m_idx][a_idx]
-            if hist:
-                ax.plot(round_ticks[:len(hist)], hist,
-                        label=attack_label, color=color, linestyle=ls,
-                        linewidth=1.8, marker='o', markersize=3)
-        ax.set_xlabel('Communication Round', fontsize=12)
-        ax.set_ylabel('Test Accuracy (%)', fontsize=12)
-        ax.set_title(
-            f'{ds_upper} — {method_label}\n'
-            f'Byzantine={byz_ratio:.0%}, Dirichlet α={noniid_alpha}, Mesh d=6',
-            fontsize=12, fontweight='bold'
-        )
-        ax.set_ylim(0, 100)
-        ax.legend(fontsize=9, ncol=2, loc='lower right')
-        ax.grid(True, alpha=0.3)
-        plt.tight_layout()
-        method_path = save_dir / f'acc_per_method_{method_key}_{tag}.png'
-        plt.savefig(method_path, dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"Per-method curve saved: {method_path.name}")
+        # ── per-attack 折线图 ────────────────────────────────
+        for a_idx, (attack_key, attack_label) in enumerate(zip(active_attack_keys, active_attack_labels)):
+            fig, ax = plt.subplots(figsize=(8, 5))
+            for m_idx, (method_label, color, ls) in enumerate(
+                    zip(active_method_labels, active_method_colors, active_method_linestyles)):
+                hist = histories[m_idx][a_idx]
+                if hist:
+                    ax.plot(round_ticks[:len(hist)], hist,
+                            label=method_label, color=color, linestyle=ls,
+                            linewidth=1.8, marker='o', markersize=3)
+            ax.set_xlabel('Communication Round', fontsize=12)
+            ax.set_ylabel('Test Accuracy (%)', fontsize=12)
+            ax.set_title(
+                f'{ds_upper} — {attack_label}  [run {run_idx}]\n'
+                f'Byzantine={byz_ratio:.0%}, Dirichlet α={noniid_alpha}, Mesh d=6',
+                fontsize=12, fontweight='bold'
+            )
+            ax.set_ylim(0, 100)
+            ax.legend(fontsize=9, ncol=2, loc='lower right')
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(run_dir / f'acc_per_attack_{attack_key}_{tag}.png', dpi=300, bbox_inches='tight')
+            plt.close()
 
-    # ── 控制台表格 ──────────────────────────────────────────
-    print("\n" + "=" * 80)
-    print(f"{'Method':>12}", end="")
-    for label in active_attack_labels:
-        print(f"  {label:>10}", end="")
-    print()
-    print("-" * 80)
-    for m_idx, label in enumerate(active_method_labels):
-        print(f"{label:>12}", end="")
-        for a_idx in range(len(active_attack_keys)):
-            print(f"  {results[m_idx, a_idx]:>9.2f}%", end="")
+        # ── per-method 折线图 ────────────────────────────────
+        for m_idx, (method_key, method_label) in enumerate(zip(active_method_keys, active_method_labels)):
+            fig, ax = plt.subplots(figsize=(8, 5))
+            for a_idx, (attack_label, color, ls) in enumerate(
+                    zip(active_attack_labels,
+                        [ATTACK_COLORS[i] for i in attack_indices],
+                        [ATTACK_LINESTYLES[i] for i in attack_indices])):
+                hist = histories[m_idx][a_idx]
+                if hist:
+                    ax.plot(round_ticks[:len(hist)], hist,
+                            label=attack_label, color=color, linestyle=ls,
+                            linewidth=1.8, marker='o', markersize=3)
+            ax.set_xlabel('Communication Round', fontsize=12)
+            ax.set_ylabel('Test Accuracy (%)', fontsize=12)
+            ax.set_title(
+                f'{ds_upper} — {method_label}  [run {run_idx}]\n'
+                f'Byzantine={byz_ratio:.0%}, Dirichlet α={noniid_alpha}, Mesh d=6',
+                fontsize=12, fontweight='bold'
+            )
+            ax.set_ylim(0, 100)
+            ax.legend(fontsize=9, ncol=2, loc='lower right')
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(run_dir / f'acc_per_method_{method_key}_{tag}.png', dpi=300, bbox_inches='tight')
+            plt.close()
+
+        # ── 本 run JSON ──────────────────────────────────────
+        import json
+        run_data = {
+            'meta': {
+                'dataset': dataset_name,
+                'run_idx': run_idx,
+                'num_runs': num_runs,
+                'seed': run_seed,
+                'byzantine_ratio': byz_ratio,
+                'noniid_alpha': noniid_alpha,
+                'num_rounds': num_rounds,
+                'log_interval': log_interval,
+                'round_ticks': round_ticks,
+                'methods': active_method_keys,
+                'attacks': active_attack_keys,
+            },
+            'final_acc': {
+                active_method_keys[m]: {active_attack_keys[a]: float(results[m, a])
+                                 for a in range(len(active_attack_keys))}
+                for m in range(len(active_method_keys))
+            },
+            'histories': {
+                active_method_keys[m]: {active_attack_keys[a]: histories[m][a]
+                                 for a in range(len(active_attack_keys))}
+                for m in range(len(active_method_keys))
+            },
+        }
+        with open(run_dir / f'data_{tag}.json', 'w') as f:
+            json.dump(run_data, f, indent=2)
+        print(f"Run {run_idx} saved → {run_dir.name}", flush=True)
+
+        # ── 控制台表格 ──────────────────────────────────────
+        print(f"\nRun {run_idx} results:")
+        print(f"{'Method':>12}", end="")
+        for label in active_attack_labels:
+            print(f"  {label:>10}", end="")
         print()
+        print("-" * 80)
+        for m_idx, label in enumerate(active_method_labels):
+            print(f"{label:>12}", end="")
+            for a_idx in range(len(active_attack_keys)):
+                print(f"  {results[m_idx, a_idx]:>9.2f}%", end="")
+            print()
 
-    # ── 原始数据保存（供二次绘图）────────────────────────────
-    data = {
+    # ── summary.json（汇总所有 run 的 final_acc）────────────
+    import json
+    stacked = np.stack(all_final_acc, axis=0)  # (num_runs, n_m, n_a)
+    mean_results = stacked.mean(axis=0)
+    std_results = stacked.std(axis=0)
+    summary = {
         'meta': {
             'dataset': dataset_name,
-            'byzantine_ratio': byz_ratio,
-            'noniid_alpha': noniid_alpha,
-            'num_rounds': num_rounds,
-            'log_interval': log_interval,
-            'round_ticks': round_ticks,
+            'num_runs': num_runs,
             'methods': active_method_keys,
             'attacks': active_attack_keys,
         },
-        'final_acc': {
-            active_method_keys[m]: {active_attack_keys[a]: float(results[m, a])
+        'per_run_final_acc': [
+            {active_method_keys[m]: {active_attack_keys[a]: float(all_final_acc[r][m, a])
+                              for a in range(len(active_attack_keys))}
+             for m in range(len(active_method_keys))}
+            for r in range(num_runs)
+        ],
+        'mean': {
+            active_method_keys[m]: {active_attack_keys[a]: float(mean_results[m, a])
                              for a in range(len(active_attack_keys))}
             for m in range(len(active_method_keys))
         },
-        'histories': {
-            active_method_keys[m]: {active_attack_keys[a]: histories[m][a]
+        'std': {
+            active_method_keys[m]: {active_attack_keys[a]: float(std_results[m, a])
                              for a in range(len(active_attack_keys))}
             for m in range(len(active_method_keys))
         },
     }
-    import json
-    json_path = save_dir / f'data_{tag}.json'
-    with open(json_path, 'w') as f:
-        json.dump(data, f, indent=2)
-    print(f"Raw data saved: {json_path.name}")
+    with open(batch_dir / 'summary.json', 'w') as f:
+        json.dump(summary, f, indent=2)
+    print(f"\nSummary saved → {batch_dir / 'summary.json'}", flush=True)
 
-    # ── LaTeX 表格 ──────────────────────────────────────────
-    print(f"\n% LaTeX table ({ds_upper}):")
-    print("\\begin{table}[t]")
-    print("\\centering")
-    print(f"\\caption{{{ds_upper} Test Accuracy (\\%) under 6 Attack Types "
-          f"(Byzantine={byz_ratio:.0%}, $\\alpha={noniid_alpha}$, Mesh $d=6$)}}")
-    print(f"\\label{{tab:multi-attack-{dataset_name}}}")
-    cols = "l" + "c" * len(active_attack_keys)
-    print(f"\\begin{{tabular}}{{{cols}}}")
-    print("\\toprule")
-    print("Method & " + " & ".join(active_attack_labels) + " \\\\")
-    print("\\midrule")
-    best_per_col = results.argmax(axis=0)
-    for m_idx, label in enumerate(active_method_labels):
-        row_parts = []
-        for a_idx in range(len(active_attack_keys)):
-            val_str = f"{results[m_idx, a_idx]:.1f}"
-            if best_per_col[a_idx] == m_idx:
-                row_parts.append(f"\\textbf{{{val_str}}}")
-            else:
-                row_parts.append(val_str)
-        print(f"{label} & " + " & ".join(row_parts) + " \\\\")
-    print("\\bottomrule")
-    print("\\end{tabular}")
-    print("\\end{table}")
-
-    return results
+    return mean_results
 
 
 def run_multi_attack_table(config_path=None):

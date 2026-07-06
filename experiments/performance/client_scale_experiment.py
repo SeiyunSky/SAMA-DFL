@@ -29,7 +29,7 @@ from utils import load_mnist, load_mnist_gpu
 from utils import make_run_log_dir, open_task_log, append_task_log, finalize_task_log
 from utils.topology import generate_mesh_topology
 from attacks import (GaussianAttack, LabelFlippingAttack, OmniscientAttack,
-                     KrumAttack, TrimAttack, BrokenNodeAttack, NoAttack)
+                     ALIEAttack, KrumAttack, TrimAttack, BrokenNodeAttack, NoAttack)
 
 
 def _build_attack(attack_key, num_byzantine, config):
@@ -50,6 +50,9 @@ def _build_attack(attack_key, num_byzantine, config):
     elif attack_key == 'trim_attack':
         return TrimAttack(num_byzantine=num_byzantine,
                           trim_ratio=atk.get('trim_ratio', 0.1))
+    elif attack_key == 'alie':
+        return ALIEAttack(num_byzantine=num_byzantine,
+                          num_clients=config['federated']['num_clients'])
     elif attack_key == 'broken_node':
         return BrokenNodeAttack()
     elif attack_key == 'none':
@@ -189,7 +192,7 @@ def _train_one(config, method, device, neighbors=None, progress_queue=None,
         no_attack = isinstance(attack, (NoAttack, BrokenNodeAttack))
         if not no_attack and not isinstance(attack, LabelFlippingAttack):
             honest_vecs = [local_vecs[i] for i in honest_nodes]
-            if isinstance(attack, (OmniscientAttack, KrumAttack, TrimAttack)):
+            if isinstance(attack, (OmniscientAttack, ALIEAttack, KrumAttack, TrimAttack)):
                 for byz_id in byzantine_nodes:
                     local_vecs[byz_id] = attack.attack(honest_vecs)
             else:

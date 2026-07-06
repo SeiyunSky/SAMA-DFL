@@ -140,11 +140,48 @@ class TrimAttack:
         return torch.where(attack_sign < 0, lower_bound, upper_bound)
 
 
+class ALIEAttack:
+    """
+    A Little Is Enough (ALIE) attack — Baruch et al., NeurIPS 2019.
+    每个坐标将恶意向量构造在诚实梯度分布的统计置信区间边界，
+    使其在中值/均值型聚合下无法被识别为异常。
+    """
+    def __init__(self, num_byzantine: int, num_clients: int):
+        self.num_byzantine = num_byzantine
+        self.num_clients = num_clients
+        self.name = "ALIE"
+
+    def attack(self, honest_vecs):
+        """honest_vecs: List[Tensor[D]] 或 Tensor[N, D]"""
+        if isinstance(honest_vecs, list):
+            mat = torch.stack(honest_vecs)   # [n_honest, D]
+        else:
+            mat = honest_vecs
+
+        n = self.num_clients
+        b = self.num_byzantine
+        s = int(np.floor(n / 2.0 + 1)) - b   # 使恶意向量刚好被接受的临界数量
+
+        # 按 Baruch et al. 公式求 z*：最大的 z 使得 Phi(z) < (n-b-s)/(n-b)
+        from scipy import stats as scipy_stats
+        threshold = (n - b - s) / (n - b)
+        threshold = np.clip(threshold, 1e-6, 1 - 1e-6)
+        z = float(scipy_stats.norm.ppf(threshold))
+
+        mu  = mat.mean(dim=0)    # [D]
+        std = mat.std(dim=0).clamp(min=1e-6)   # [D]
+
+        # 恶意向量：均值 - z * 标准差（每坐标推到分布下界）
+        mal_vec = mu - z * std
+        return mal_vec
+
+
 ATTACK_REGISTRY = {
     'none': NoAttack,
     'gaussian': GaussianAttack,
     'label_flipping': LabelFlippingAttack,
     'omniscient': OmniscientAttack,
+    'alie': ALIEAttack,
     'krum_attack': KrumAttack,
     'trim_attack': TrimAttack,
     'broken_node': BrokenNodeAttack,

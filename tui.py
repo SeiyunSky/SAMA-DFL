@@ -208,7 +208,7 @@ EXPERIMENTS = {
             ('B2', 'cifar10_attack_table','CIFAR-10 多攻击汇总（8方法×6攻击）'),
             ('B3', 'byz_sweep',           '拜占庭比例扫描 (0.1~0.4)'),
             ('B4', 'noniid_sweep',        'Non-IID 程度扫描 (α=0.1/0.2/0.3)'),
-            ('B5', 'ablation',            '消融实验（6种变体）'),
+            ('B5', 'ablation',            '消融实验（5种变体）'),
             ('B6', 'client_scale',        '客户端数量扩展性（n=20/30/40）'),
         ]
     },
@@ -217,12 +217,14 @@ EXPERIMENTS = {
 PERF_GROUPS = {'B'}
 NO_ATTACK_PROMPT = {'multi_attack_table', 'cifar10_attack_table', 'client_scale'}
 TABLE_ATTACK_PROMPT = {'multi_attack_table', 'cifar10_attack_table'}
+ABLATION_ATTACK_PROMPT = {'ablation'}
 
 ALL_ATTACKS = [
     ('none',           'No Attack'),
     ('gaussian',       'Gaussian'),
     ('label_flipping', 'Label Flipping'),
     ('omniscient',     'Omniscient'),
+    ('alie',           'ALIE'),
     ('krum_attack',    'Krum Attack'),
     ('trim_attack',    'Trim Attack'),
     ('broken_node',    'Broken Node'),
@@ -538,18 +540,30 @@ def choose_attack():
     console.print()
     console.print("[bold]选择攻击类型[/bold]（留空使用配置文件默认值）")
     console.print("  [cyan]1[/cyan] Gaussian        [cyan]2[/cyan] Label Flipping")
-    console.print("  [cyan]3[/cyan] Omniscient      [cyan]4[/cyan] Krum Attack")
-    console.print("  [cyan]5[/cyan] Trim Attack     [cyan]6[/cyan] Broken Node")
+    console.print("  [cyan]3[/cyan] Omniscient      [cyan]4[/cyan] ALIE")
+    console.print("  [cyan]5[/cyan] Krum Attack     [cyan]6[/cyan] Trim Attack     [cyan]7[/cyan] Broken Node")
     choice = Prompt.ask("攻击", default="").strip()
     mapping = {
         '1': 'gaussian', '2': 'label_flipping',
-        '3': 'omniscient', '4': 'krum_attack', '5': 'trim_attack',
-        '6': 'broken_node',
+        '3': 'omniscient', '4': 'alie', '5': 'krum_attack',
+        '6': 'trim_attack', '7': 'broken_node',
         'gaussian': 'gaussian', 'label_flipping': 'label_flipping',
-        'omniscient': 'omniscient', 'krum_attack': 'krum_attack',
-        'trim_attack': 'trim_attack', 'broken_node': 'broken_node',
+        'omniscient': 'omniscient', 'alie': 'alie',
+        'krum_attack': 'krum_attack', 'trim_attack': 'trim_attack',
+        'broken_node': 'broken_node',
     }
     return mapping.get(choice, None)
+
+
+def choose_num_runs():
+    """询问本次批量跑几次。返回字符串（'1' 表示单次）。"""
+    raw = Prompt.ask("[bold]批量运行次数[/bold]（留空=1次）", default="1").strip()
+    try:
+        n = max(1, int(raw))
+    except ValueError:
+        n = 1
+    console.print(f"[green]将跑 {n} 次[/green]")
+    return str(n)
 
 
 def choose_attacks_multi():
@@ -620,7 +634,7 @@ def resolve_experiment(choice):
     for group_key, group in EXPERIMENTS.items():
         for idx_key, exp_key, label in group['items']:
             if choice in (idx_key.upper(), exp_key.upper(), exp_key.lower()):
-                needs_attack = group_key in PERF_GROUPS and exp_key not in NO_ATTACK_PROMPT
+                needs_attack = group_key in PERF_GROUPS and exp_key not in NO_ATTACK_PROMPT and exp_key not in ABLATION_ATTACK_PROMPT
                 return exp_key, label, needs_attack
     return None
 
@@ -681,14 +695,21 @@ def main():
         exp_key, label, needs_attack = result
         extra_env = None
         if exp_key in TABLE_ATTACK_PROMPT:
+            num_runs_str = choose_num_runs()
             attacks_csv = choose_attacks_multi()
             methods_csv = choose_methods_multi()
             attack = None  # 由 TABLE_ATTACKS 控制
-            extra_env = {}
+            extra_env = {'TABLE_NUM_RUNS': num_runs_str}
             if attacks_csv:
                 extra_env['TABLE_ATTACKS'] = attacks_csv
             if methods_csv:
                 extra_env['TABLE_METHODS'] = methods_csv
+        elif exp_key in ABLATION_ATTACK_PROMPT:
+            attacks_csv = choose_attacks_multi()
+            attack = None  # 由 ABLATION_ATTACKS 控制
+            extra_env = {}
+            if attacks_csv:
+                extra_env['ABLATION_ATTACKS'] = attacks_csv
             if not extra_env:
                 extra_env = None
         else:

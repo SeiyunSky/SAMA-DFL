@@ -29,7 +29,7 @@ from utils import load_mnist, load_mnist_gpu, generate_ring_topology
 from utils import make_run_log_dir, open_task_log, append_task_log, finalize_task_log
 from utils.topology import generate_mesh_topology
 from attacks import (GaussianAttack, LabelFlippingAttack, OmniscientAttack,
-                     KrumAttack, TrimAttack, BrokenNodeAttack, NoAttack)
+                     ALIEAttack, KrumAttack, TrimAttack, BrokenNodeAttack, NoAttack)
 from collections import OrderedDict
 
 
@@ -143,6 +143,9 @@ def train_single_run(config, method, device, neighbors=None, progress_queue=None
     elif attack_type == 'trim_attack':
         attack = TrimAttack(num_byzantine=num_byzantine,
                             trim_ratio=config['attack'].get('trim_ratio', 0.1))
+    elif attack_type == 'alie':
+        attack = ALIEAttack(num_byzantine=num_byzantine,
+                            num_clients=num_clients)
     elif attack_type == 'broken_node':
         attack = BrokenNodeAttack()
     elif attack_type == 'none':
@@ -200,7 +203,7 @@ def train_single_run(config, method, device, neighbors=None, progress_queue=None
         no_attack = isinstance(attack, (NoAttack, BrokenNodeAttack))
         if not no_attack and not isinstance(attack, LabelFlippingAttack):
             honest_vecs = [local_vecs[i] for i in honest_nodes]
-            if isinstance(attack, (OmniscientAttack, KrumAttack, TrimAttack)):
+            if isinstance(attack, (OmniscientAttack, ALIEAttack, KrumAttack, TrimAttack)):
                 for byz_id in byzantine_nodes:
                     local_vecs[byz_id] = attack.attack(honest_vecs)
             else:

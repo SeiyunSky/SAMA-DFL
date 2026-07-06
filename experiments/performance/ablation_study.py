@@ -13,6 +13,8 @@ import os
 import yaml
 import copy
 import multiprocessing
+import threading
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm as _tqdm_base
 import sys as _sys
 def tqdm(*a, **kw):
@@ -37,14 +39,13 @@ from collections import OrderedDict
 
 
 def train_ablation_run(config, aggregator, device, task_log=None):
-    """Train with a specific aggregator, return final accuracy."""
+    """Train with a specific aggregator, return (final_accuracy, acc_history)."""
     num_clients = config['federated']['num_clients']
     byz_ratio = config['federated']['byzantine_ratio']
     num_rounds = config['federated']['num_rounds']
     local_epochs = config['federated']['local_epochs']
     lr = config['optimizer']['lr']
     log_interval = config['logging']['log_interval']
-
     use_gpu_loader = bool(int(os.getenv('GPU_LOADER', '1')))
     if use_gpu_loader:
         train_loaders, test_loader = load_mnist_gpu(
@@ -94,6 +95,7 @@ def train_ablation_run(config, aggregator, device, task_log=None):
 
     models = [SimpleCNN().to(device) for _ in range(num_clients)]
     optimizers = [torch.optim.SGD(m.parameters(), lr=lr) for m in models]
+    acc_history = []
 
     for t in range(num_rounds):
         local_vecs = [None] * num_clients
@@ -123,7 +125,7 @@ def train_ablation_run(config, aggregator, device, task_log=None):
                         loss = torch.nn.functional.cross_entropy(output, target)
                         loss.backward()
                         optimizer.step()
-        local_vecs[i] = aggregator.model_to_vector(models[i])
+            local_vecs[i] = aggregator.model_to_vector(models[i])
 
         no_attack = isinstance(attack, (NoAttack, BrokenNodeAttack))
         if not no_attack and not isinstance(attack, LabelFlippingAttack):
@@ -155,7 +157,7 @@ def train_ablation_run(config, aggregator, device, task_log=None):
             aggregator.load_from_vector(models[i], vec)
 
         # 按 log_interval 评估
-        if task_log is not None and (t + 1) % log_interval == 0:
+        if (t + 1) % log_interval == 0:
             honest_vecs_eval = [updated_vecs[i] for i in honest_nodes]
             eval_mean = torch.stack(honest_vecs_eval).mean(dim=0)
             _eval_m = SimpleCNN().to(device)
@@ -167,7 +169,10 @@ def train_ablation_run(config, aggregator, device, task_log=None):
                     d_, t_ = d_.to(device, non_blocking=True), t_.to(device, non_blocking=True)
                     c_ += _eval_m(d_).argmax(dim=1).eq(t_).sum().item()
                     n_ += t_.size(0)
-            append_task_log(task_log, t + 1, num_rounds, 100.0 * c_ / n_)
+            round_acc = 100.0 * c_ / n_
+            acc_history.append(round_acc)
+            if task_log is not None:
+                append_task_log(task_log, t + 1, num_rounds, round_acc)
             del _eval_m
 
     # Evaluate
@@ -189,7 +194,7 @@ def train_ablation_run(config, aggregator, device, task_log=None):
     del train_loaders, test_loader, models, optimizers, global_model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    return acc
+    return acc, acc_history
 
 
 class NoAlignAggregator(SAMAAggregator):
@@ -349,6 +354,80 @@ class HardThresholdAggregator(SAMAAggregator):
         return agg_vec
 
 
+def _build_ablation_aggregator(spec, config, device):
+    """在子进程里根据 spec 重建 aggregator（避免跨进程传递含 CUDA tensor 的对象）。"""
+    sama_cfg = config['sama']
+    template = SimpleCNN().to(device)
+    kind = spec['kind']
+    if kind == 'sama':
+        return SAMAAggregator(
+            alpha=spec['alpha'],
+            trust_layers=spec['trust_layers'],
+            model_template=template,
+        )
+    elif kind == 'no_align':
+        return NoAlignAggregator(
+            alpha=spec['alpha'],
+            trust_layers=spec['trust_layers'],
+            model_template=template,
+        )
+    elif kind == 'no_direction':
+        return NoDirectionAggregator(
+            alpha=spec['alpha'],
+            model_template=template,
+        )
+    elif kind == 'hard_threshold':
+        return HardThresholdAggregator(
+            alpha=spec['alpha'],
+            trust_layers=spec['trust_layers'],
+            model_template=template,
+        )
+    else:
+        raise ValueError(f"Unknown ablation kind: {kind}")
+
+
+def _ablation_worker(args):
+    """顶层 worker，可被 ProcessPoolExecutor pickle。"""
+    v_idx, name, spec, config, device_str, progress_queue, run_log_dir, run_meta_base = args
+
+    seed = config.get('experiment', {}).get('seed', 42)
+    torch.manual_seed(seed + v_idx * 17)
+    np.random.seed(seed + v_idx * 17)
+
+    import time
+    device = torch.device(device_str)
+    config = copy.deepcopy(config)
+    config['federated']['num_workers'] = 0  # 子进程里禁用 DataLoader workers
+
+    aggregator = _build_ablation_aggregator(spec, config, device)
+
+    _meta = dict(run_meta_base)
+    _meta['variant'] = name
+    log_dir = Path(run_log_dir)
+    attack_key = _meta.get('attack', 'unknown')
+    log_filename = f"{name.lower().replace(' ', '_')}_{attack_key}.log"
+    task_log = open_task_log(
+        log_dir,
+        log_filename,
+        _meta,
+    )
+
+    if progress_queue is not None:
+        progress_queue.put(f"[{name}] started")
+
+    t0 = time.time()
+    acc, history = train_ablation_run(config, aggregator, device, task_log=task_log)
+    elapsed = time.time() - t0
+    finalize_task_log(task_log, acc, elapsed)
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if progress_queue is not None:
+        progress_queue.put(f"[{name}] done accuracy={acc:.2f}%")
+
+    return v_idx, name, acc, elapsed, history
+
+
 def run_ablation_study(config_path=None):
     """
     Ablation study: disable each SAMA component one at a time.
@@ -365,143 +444,208 @@ def run_ablation_study(config_path=None):
 
     device = torch.device(config['experiment']['device'])
     sama_cfg = config['sama']
-    _template_model = SimpleCNN().to(device)
 
-    # Define ablation variants
-    variants = {
-        'Full SAMA': SAMAAggregator(
-            alpha=sama_cfg['alpha'],
-            trust_layers=sama_cfg.get('trust_layers', None),
-            model_template=_template_model,
-        ),
-        'No trust_layers': SAMAAggregator(
-            alpha=sama_cfg['alpha'],
-            trust_layers=None,
-            model_template=_template_model,
-        ),
-        'No alignment': NoAlignAggregator(
-            alpha=sama_cfg['alpha'],
-            trust_layers=sama_cfg.get('trust_layers', None),
-            model_template=_template_model,
-        ),
-        'No direction': NoDirectionAggregator(
-            alpha=sama_cfg['alpha'],
-            model_template=_template_model,
-        ),
-        'No self-anchor': SAMAAggregator(
-            alpha=0.0,
-            trust_layers=sama_cfg.get('trust_layers', None),
-            model_template=_template_model,
-        ),
-        'Hard threshold': HardThresholdAggregator(
-            alpha=sama_cfg['alpha'],
-            trust_layers=sama_cfg.get('trust_layers', None),
-            model_template=_template_model,
-        ),
-    }
+    # variant 用纯数据描述，子进程里重建（避免跨进程传 CUDA 对象）
+    variant_specs = [
+        ('Full SAMA',      {'kind': 'sama',          'alpha': sama_cfg['alpha'],  'trust_layers': sama_cfg.get('trust_layers', None)}),
+        ('No alignment',   {'kind': 'no_align',      'alpha': sama_cfg['alpha'],  'trust_layers': sama_cfg.get('trust_layers', None)}),
+        ('No direction',   {'kind': 'no_direction',  'alpha': sama_cfg['alpha'],  'trust_layers': None}),
+        ('No self-anchor', {'kind': 'sama',          'alpha': 0.0,                'trust_layers': sama_cfg.get('trust_layers', None)}),
+        ('Hard threshold', {'kind': 'hard_threshold','alpha': sama_cfg['alpha'],  'trust_layers': sama_cfg.get('trust_layers', None)}),
+    ]
 
-    results = {}
-    attack_type = os.getenv('ATTACK_TYPE', config['attack']['type'])
+    # 支持多攻击：ABLATION_ATTACKS=gaussian,omniscient 或留空=全部
+    _attacks_env = os.getenv('ABLATION_ATTACKS', '').strip()
+    VALID_ATTACKS = ['none', 'gaussian', 'label_flipping', 'omniscient',
+                     'krum_attack', 'trim_attack', 'broken_node']
+    if _attacks_env:
+        attack_keys = [k.strip() for k in _attacks_env.split(',') if k.strip() in VALID_ATTACKS]
+        if not attack_keys:
+            attack_keys = list(VALID_ATTACKS)
+    else:
+        # 未设置 ABLATION_ATTACKS：跑全部（忽略 ATTACK_TYPE，避免单攻击污染）
+        attack_keys = list(VALID_ATTACKS)
+
     byz_ratio = config['federated']['byzantine_ratio']
     noniid_alpha = config['data']['non_iid_alpha']
 
     from datetime import datetime
     run_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    from pathlib import Path
     run_log_dir = make_run_log_dir(
         'ablation',
         run_ts,
         base_dir=Path(__file__).parent.parent.parent / 'results',
     )
-    run_meta_base = {
-        'exp_name'    : 'ablation_study',
-        'dataset'     : 'mnist',
-        'attack'      : attack_type,
-        'byz_ratio'   : f"{byz_ratio:.2f}",
-        'noniid_alpha': str(noniid_alpha),
-        'num_clients' : str(config['federated']['num_clients']),
-        'num_rounds'  : str(config['federated']['num_rounds']),
-        'lr'          : str(config['optimizer']['lr']),
-        'batch_size'  : str(config['federated']['batch_size']),
-    }
     print(f"  Run logs → {run_log_dir}", flush=True)
+    print(f"  Attacks: {attack_keys}", flush=True)
 
-    import time
-    for name, aggregator in variants.items():
-        print(f"\n  Running: {name}...")
-        t0 = time.time()
-        _meta = dict(run_meta_base)
-        _meta['variant'] = name
-        task_log = open_task_log(
-            run_log_dir,
-            name.lower().replace(' ', '_') + '.log',
-            _meta,
+    max_workers = int(os.getenv('TABLE_WORKERS',
+                                config.get('experiment', {}).get('parallel_workers', 4)))
+    device_str = str(device)
+    name_order = [name for name, _ in variant_specs]
+
+    # 每个 attack 独立跑一轮所有 variant
+    all_results = {}    # attack_key -> {name: acc}
+    all_histories = {}  # attack_key -> {name: history}
+
+    for attack_key in attack_keys:
+        print(f"\n{'='*60}", flush=True)
+        print(f"  Attack: {attack_key}", flush=True)
+
+        run_meta_base = {
+            'exp_name'    : 'ablation_study',
+            'dataset'     : 'mnist',
+            'attack'      : attack_key,
+            'byz_ratio'   : f"{byz_ratio:.2f}",
+            'noniid_alpha': str(noniid_alpha),
+            'num_clients' : str(config['federated']['num_clients']),
+            'num_rounds'  : str(config['federated']['num_rounds']),
+            'lr'          : str(config['optimizer']['lr']),
+            'batch_size'  : str(config['federated']['batch_size']),
+        }
+
+        # 每个 task 用独立的 config copy，写入当前 attack
+        tasks = []
+        for v_idx, (name, spec) in enumerate(variant_specs):
+            cfg = copy.deepcopy(config)
+            cfg['attack']['type'] = attack_key
+            tasks.append((v_idx, name, spec, cfg, device_str, None,
+                          str(run_log_dir), run_meta_base))
+        total = len(tasks)
+
+        mgr = multiprocessing.Manager()
+        progress_queue = mgr.Queue()
+        tasks = [
+            (v_idx, name, spec, cfg, dev, progress_queue, log_dir, meta)
+            for v_idx, name, spec, cfg, dev, _, log_dir, meta in tasks
+        ]
+
+        done_count = [0]
+        stop_event = threading.Event()
+        def _printer():
+            while not stop_event.is_set() or not progress_queue.empty():
+                try:
+                    msg = progress_queue.get(timeout=0.2)
+                    if 'done' in msg:
+                        done_count[0] += 1
+                        print(f"  [{done_count[0]}/{total}] {msg}", flush=True)
+                    else:
+                        print(f"  {msg}", flush=True)
+                except Exception:
+                    pass
+        printer = threading.Thread(target=_printer, daemon=True)
+        printer.start()
+
+        results = {}
+        elapsed_map = {}
+        histories = {}
+
+        with ProcessPoolExecutor(max_workers=max_workers,
+                                 mp_context=multiprocessing.get_context('spawn')) as executor:
+            futures = {executor.submit(_ablation_worker, t): t for t in tasks}
+            for future in as_completed(futures):
+                v_idx, name, acc, elapsed, history = future.result()
+                results[name] = acc
+                elapsed_map[name] = elapsed
+                histories[name] = history
+
+        stop_event.set()
+        printer.join(timeout=3)
+
+        for name in name_order:
+            print(f"  -> {name}: {results[name]:.2f}%  ({elapsed_map[name]:.1f}s)")
+
+        all_results[attack_key] = results
+        all_histories[attack_key] = histories
+
+        # ── Bar chart（每个 attack 一张）────────────────────
+        save_dir = Path(__file__).parent.parent.parent / 'results'
+        save_dir.mkdir(exist_ok=True)
+        tag = f"ablation_{attack_key}_byz{int(byz_ratio * 100)}"
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        fig.suptitle(
+            f"Ablation Study | Attack={attack_key} | Byzantine={byz_ratio:.0%} | α={noniid_alpha}",
+            fontsize=12, fontweight='bold'
         )
-        acc = train_ablation_run(config, aggregator, device, task_log=task_log)
-        elapsed = time.time() - t0
-        finalize_task_log(task_log, acc, elapsed)
-        results[name] = acc
-        print(f"  -> Accuracy: {acc:.2f}%  ({elapsed:.1f}s)")
+        names = name_order
+        accs = [results[n] for n in names]
+        colors = ['#2196F3' if n == 'Full SAMA' else '#FF9800' for n in names]
+        bars = ax.bar(range(len(names)), accs, color=colors, alpha=0.8)
+        ax.set_xticks(range(len(names)))
+        ax.set_xticklabels(names, rotation=15, ha='right')
+        ax.set_ylabel('Test Accuracy (%)', fontsize=12)
+        ax.grid(True, alpha=0.3, axis='y')
+        for bar, acc in zip(bars, accs):
+            ax.text(bar.get_x() + bar.get_width() / 2., bar.get_height() + 0.5,
+                    f'{acc:.1f}%', ha='center', va='bottom', fontweight='bold')
+        full_acc = results['Full SAMA']
+        for i, name in enumerate(name_order):
+            acc = results[name]
+            if name != 'Full SAMA':
+                drop = full_acc - acc
+                if drop > 0:
+                    ax.text(i, acc / 2, f'-{drop:.1f}pp', ha='center', va='center',
+                           fontsize=10, color='red', fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(save_dir / f"{tag}.png", dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"  Bar chart saved: {tag}.png")
 
-    # Plot
-    fig, ax = plt.subplots(figsize=(10, 6))
+        # ── 收敛曲线图（每个 attack 一张，6 variant 叠在一起）──
+        log_interval = config['logging']['log_interval']
+        num_rounds_cfg = config['federated']['num_rounds']
+        round_ticks = list(range(log_interval, num_rounds_cfg + 1, log_interval))
+        variant_colors = ['#2196F3', '#FF9800', '#4CAF50', '#F44336', '#9C27B0', '#795548']
+        fig2, ax2 = plt.subplots(figsize=(10, 6))
+        for color, name in zip(variant_colors, name_order):
+            hist = histories.get(name, [])
+            if hist:
+                ax2.plot(round_ticks[:len(hist)], hist,
+                         label=name, color=color,
+                         linewidth=1.8, marker='o', markersize=3)
+        ax2.set_xlabel('Communication Round', fontsize=12)
+        ax2.set_ylabel('Test Accuracy (%)', fontsize=12)
+        ax2.set_title(
+            f"Ablation Convergence | Attack={attack_key} | Byzantine={byz_ratio:.0%} | α={noniid_alpha}",
+            fontsize=12, fontweight='bold'
+        )
+        ax2.set_ylim(0, 100)
+        ax2.legend(fontsize=9, ncol=2, loc='lower right')
+        ax2.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(save_dir / f"{tag}_convergence.png", dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"  Convergence curve saved: {tag}_convergence.png")
 
-    attack_type = os.getenv('ATTACK_TYPE', config['attack']['type'])
-    byz_ratio = config['federated']['byzantine_ratio']
-    noniid_alpha = config['data']['non_iid_alpha']
-    fig.suptitle(f"Ablation Study | Attack={attack_type} | Byzantine={byz_ratio:.0%} | α={noniid_alpha}",
-                 fontsize=12, fontweight='bold')
+        # ── JSON ─────────────────────────────────────────────
+        import json
+        json_path = save_dir / f"{tag}.json"
+        with open(json_path, 'w') as f:
+            json.dump({
+                'meta': {
+                    'attack_type': attack_key,
+                    'byz_ratio': byz_ratio,
+                    'noniid_alpha': noniid_alpha,
+                    'num_rounds': num_rounds_cfg,
+                    'log_interval': log_interval,
+                    'round_ticks': round_ticks,
+                },
+                'results': results,
+                'histories': {name: histories.get(name, []) for name in name_order},
+            }, f, indent=2)
+        print(f"  Raw data saved: {json_path.name}")
 
-    names = list(results.keys())
-    accs = list(results.values())
-    colors = ['#2196F3' if n == 'Full SAMA' else '#FF9800' for n in names]
-
-    bars = ax.bar(range(len(names)), accs, color=colors, alpha=0.8)
-    ax.set_xticks(range(len(names)))
-    ax.set_xticklabels(names, rotation=15, ha='right')
-    ax.set_ylabel('Test Accuracy (%)', fontsize=12)
-    ax.grid(True, alpha=0.3, axis='y')
-
-    for bar, acc in zip(bars, accs):
-        ax.text(bar.get_x() + bar.get_width() / 2., bar.get_height() + 0.5,
-                f'{acc:.1f}%', ha='center', va='bottom', fontweight='bold')
-
-    # Add drop annotations
-    full_acc = results['Full SAMA']
-    for i, (name, acc) in enumerate(results.items()):
-        if name != 'Full SAMA':
+        # ── 控制台表格 ────────────────────────────────────────
+        print(f"\n  {'Variant':>20}  {'Accuracy':>10}  {'Drop':>8}")
+        print(f"  {'-'*48}")
+        for name in name_order:
+            acc = results[name]
             drop = full_acc - acc
-            if drop > 0:
-                ax.text(i, acc / 2, f'-{drop:.1f}pp', ha='center', va='center',
-                       fontsize=10, color='red', fontweight='bold')
+            drop_str = f"-{drop:.1f}pp" if name != 'Full SAMA' else "-"
+            print(f"  {name:>20}  {acc:>9.2f}%  {drop_str:>8}")
 
-    plt.tight_layout()
-
-    save_dir = Path(__file__).parent.parent.parent / 'results'
-    save_dir.mkdir(exist_ok=True)
-    fname = f"ablation_{attack_type}_byz{int(byz_ratio * 100)}.png"
-    plt.savefig(save_dir / fname, dpi=300, bbox_inches='tight')
-    plt.close()
-    import json
-    json_path = save_dir / fname.replace('.png', '.json')
-    with open(json_path, 'w') as f:
-        json.dump({
-            'meta': {'attack_type': attack_type, 'byz_ratio': byz_ratio},
-            'results': results,
-        }, f, indent=2)
-    print(f"Raw data saved: {json_path.name}")
-    print(f"\nPlot saved to: {save_dir / fname}")
-
-    # Print table
-    print("\n" + "=" * 50)
-    print(f"{'Variant':>20}  {'Accuracy':>10}  {'Drop':>8}")
-    print("-" * 50)
-    for name, acc in results.items():
-        drop = full_acc - acc
-        drop_str = f"-{drop:.1f}pp" if name != 'Full SAMA' else "-"
-        print(f"{name:>20}  {acc:>9.2f}%  {drop_str:>8}")
-
-    return results
+    return all_results
 
 
 if __name__ == "__main__":

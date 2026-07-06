@@ -78,7 +78,7 @@ def run_all_performance_experiments():
     module = importlib.import_module('sweep_experiments')
     module.run_noniid_sweep()
 
-    print("\n[5/5] Ablation study (4 variants)")
+    print("\n[5/5] Ablation study (5 variants)")
     module = importlib.import_module('ablation_study')
     module.run_ablation_study()
 

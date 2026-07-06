@@ -87,6 +87,7 @@ class SAMAAggregator(BaseAggregator):
             cos_sims[valid_mask] = dots / (neighbor_trust_norms[valid_mask] * w_i_trust_norm)
 
         phi = torch.clamp(cos_sims / tau if self.use_temperature else cos_sims, min=0.0)
+
         valid = (phi > 0) & valid_mask
 
         if not valid.any():

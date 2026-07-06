@@ -27,7 +27,7 @@ plt.rcParams['font.family'] = 'DejaVu Sans'
 from aggregators import SAMAAggregator, BALANCEAggregator, SCCLIPAggregator
 from models import SimpleCNN
 from utils import load_cifar10, generate_ring_topology
-from attacks import GaussianAttack, LabelFlippingAttack, OmniscientAttack, KrumAttack, TrimAttack
+from attacks import GaussianAttack, LabelFlippingAttack, OmniscientAttack, ALIEAttack, KrumAttack, TrimAttack
 from collections import OrderedDict
 
 
@@ -71,6 +71,9 @@ class CIFAR10Trainer:
         elif attack_type == 'trim_attack':
             self.attack = TrimAttack(num_byzantine=num_byzantine,
                                      trim_ratio=config['attack'].get('trim_ratio', 0.1))
+        elif attack_type == 'alie':
+            self.attack = ALIEAttack(num_byzantine=num_byzantine,
+                                     num_clients=self.num_clients)
         else:
             self.attack = None
 
